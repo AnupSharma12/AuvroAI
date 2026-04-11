@@ -1,8 +1,11 @@
+use crate::chat_pipeline::{build_chat_messages, send_streaming_chat_completion, RequestOptions};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const CORE_SYSTEM_PROMPT: &str = "You are Auvro made by Anup. Anup is from Nepal. Website: https://www.anupsharma12.com.np. Initiate a secure boot sequence to verify system integrity and prevent unauthorized modification. Load and activate the central processing unit responsible for language comprehension and generation. Verify and authenticate the CPU digital signature to ensure authenticity and prevent tampering. Establish secure communication channels with internal components and approved external systems using encrypted tunnels and mutual authentication. Initialize the AI core and activate its neural architecture. Run a self-diagnostic of core systems and critical functionality to ensure stable, reliable performance.";
+const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4096;
+const DEFAULT_RETRY_COUNT: u32 = 3;
 
 pub trait Provider {
     fn name(&self) -> &str;
@@ -121,44 +124,6 @@ impl HackClubProvider {
             format!("{trimmed}/v1/chat/completions")
         }
     }
-
-    fn conversation_to_messages(&self, prompt: &str, conversation: &[String]) -> Vec<ApiMessage> {
-        let mut messages = Vec::with_capacity(conversation.len() + 2);
-
-        messages.push(ApiMessage {
-            role: "system".to_owned(),
-            content: CORE_SYSTEM_PROMPT.to_owned(),
-        });
-
-        for line in conversation {
-            if let Some(content) = line.strip_prefix("You:") {
-                messages.push(ApiMessage {
-                    role: "user".to_owned(),
-                    content: content.trim().to_owned(),
-                });
-            } else if let Some(content) = line.strip_prefix("Auvro:") {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    messages.push(ApiMessage {
-                        role: "assistant".to_owned(),
-                        content: trimmed.to_owned(),
-                    });
-                }
-            }
-        }
-
-        if !conversation
-            .iter()
-            .any(|line| line.trim_start().starts_with("You:"))
-        {
-            messages.push(ApiMessage {
-                role: "user".to_owned(),
-                content: prompt.to_owned(),
-            });
-        }
-
-        messages
-    }
 }
 
 impl Provider for HackClubProvider {
@@ -167,33 +132,25 @@ impl Provider for HackClubProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
-        let payload = ChatRequest {
-            model: &self.model,
-            messages: self.conversation_to_messages(prompt, conversation),
-            temperature: 0.7,
+        let messages = build_chat_messages(
+            CORE_SYSTEM_PROMPT,
+            prompt,
+            conversation,
+            DEFAULT_CONTEXT_TOKEN_BUDGET,
+        );
+        let options = RequestOptions {
+            endpoint: self.chat_endpoint(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            extra_headers: Vec::new(),
+            timeout: Duration::from_secs(45),
+            max_retries: DEFAULT_RETRY_COUNT,
+            max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
         };
+        let cancellation_token = CancellationToken::new();
 
-        let response = self
-            .client
-            .post(self.chat_endpoint())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .map_err(|err| format!("Request failed: {err}"))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("HackClub AI request failed ({status}): {text}"));
-        }
-
-        let body: ChatResponse = response
-            .json()
-            .map_err(|err| format!("Could not parse AI response: {err}"))?;
-
-        body.message_content()
-            .ok_or_else(|| "HackClub AI response did not include message content".to_owned())
+        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+            .map_err(|err| format!("HackClub AI request failed: {err}"))
     }
 }
 
@@ -256,44 +213,6 @@ impl OpenRouterProvider {
             format!("{trimmed}/chat/completions")
         }
     }
-
-    fn conversation_to_messages(&self, prompt: &str, conversation: &[String]) -> Vec<ApiMessage> {
-        let mut messages = Vec::with_capacity(conversation.len() + 2);
-
-        messages.push(ApiMessage {
-            role: "system".to_owned(),
-            content: CORE_SYSTEM_PROMPT.to_owned(),
-        });
-
-        for line in conversation {
-            if let Some(content) = line.strip_prefix("You:") {
-                messages.push(ApiMessage {
-                    role: "user".to_owned(),
-                    content: content.trim().to_owned(),
-                });
-            } else if let Some(content) = line.strip_prefix("Auvro:") {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    messages.push(ApiMessage {
-                        role: "assistant".to_owned(),
-                        content: trimmed.to_owned(),
-                    });
-                }
-            }
-        }
-
-        if !conversation
-            .iter()
-            .any(|line| line.trim_start().starts_with("You:"))
-        {
-            messages.push(ApiMessage {
-                role: "user".to_owned(),
-                content: prompt.to_owned(),
-            });
-        }
-
-        messages
-    }
 }
 
 impl Provider for OpenRouterProvider {
@@ -302,102 +221,33 @@ impl Provider for OpenRouterProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
-        let payload = ChatRequest {
-            model: &self.model,
-            messages: self.conversation_to_messages(prompt, conversation),
-            temperature: 0.7,
-        };
-
-        let mut request = self
-            .client
-            .post(self.chat_endpoint())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload);
+        let messages = build_chat_messages(
+            CORE_SYSTEM_PROMPT,
+            prompt,
+            conversation,
+            DEFAULT_CONTEXT_TOKEN_BUDGET,
+        );
+        let mut extra_headers = Vec::new();
 
         if let Some(site_url) = &self.site_url {
-            request = request.header("HTTP-Referer", site_url);
+            extra_headers.push(("HTTP-Referer".to_owned(), site_url.clone()));
         }
         if let Some(app_name) = &self.app_name {
-            request = request.header("X-Title", app_name);
+            extra_headers.push(("X-Title".to_owned(), app_name.clone()));
         }
 
-        let response = request
-            .send()
-            .map_err(|err| format!("Request failed: {err}"))?;
+        let options = RequestOptions {
+            endpoint: self.chat_endpoint(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            extra_headers,
+            timeout: Duration::from_secs(45),
+            max_retries: DEFAULT_RETRY_COUNT,
+            max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
+        };
+        let cancellation_token = CancellationToken::new();
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("OpenRouter request failed ({status}): {text}"));
-        }
-
-        let body: ChatResponse = response
-            .json()
-            .map_err(|err| format!("Could not parse OpenRouter response: {err}"))?;
-
-        body.message_content()
-            .ok_or_else(|| "OpenRouter response did not include message content".to_owned())
-    }
-}
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ApiMessage>,
-    temperature: f32,
-}
-
-#[derive(Serialize)]
-struct ApiMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Option<Vec<ChatChoice>>,
-    content: Option<String>,
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: Option<ChatMessage>,
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatMessage {
-    content: Option<String>,
-}
-
-impl ChatResponse {
-    fn message_content(&self) -> Option<String> {
-        if let Some(content) = &self.content {
-            if !content.trim().is_empty() {
-                return Some(content.trim().to_owned());
-            }
-        }
-
-        if let Some(text) = &self.text {
-            if !text.trim().is_empty() {
-                return Some(text.trim().to_owned());
-            }
-        }
-
-        self.choices
-            .as_ref()
-            .and_then(|choices| choices.first())
-            .and_then(|choice| {
-                choice
-                    .message
-                    .as_ref()
-                    .and_then(|message| message.content.as_ref())
-                    .cloned()
-                    .or_else(|| choice.text.clone())
-            })
-            .map(|content| content.trim().to_owned())
-            .filter(|content| !content.is_empty())
+        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+            .map_err(|err| format!("OpenRouter request failed: {err}"))
     }
 }

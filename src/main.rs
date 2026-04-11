@@ -1,3 +1,4 @@
+mod chat_pipeline;
 mod secrets;
 mod provider;
 
