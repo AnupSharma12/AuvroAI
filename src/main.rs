@@ -1,6 +1,8 @@
 mod secrets;
+mod provider;
 
 use eframe::egui;
+use provider::{MockProvider, Provider};
 use secrets::SecretStore;
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,7 @@ struct ChatSession {
 }
 
 struct AuvroApp {
+    provider: Box<dyn Provider>,
     draft_message: String,
     sessions: Vec<ChatSession>,
     selected_session: usize,
@@ -78,6 +81,7 @@ impl Default for AuvroApp {
             };
 
         Self {
+            provider: Box::new(MockProvider),
             draft_message: String::new(),
             sessions: vec![ChatSession {
                 name: "General".to_owned(),
@@ -464,19 +468,20 @@ impl AuvroApp {
             return;
         }
 
-        let full_response = self.generate_assistant_reply(&prompt);
+        let conversation = self.active_session().messages.clone();
+        let full_response = match self.provider.generate_reply(&prompt, &conversation) {
+            Ok(reply) => reply,
+            Err(err) => {
+                self.error_message = Some(format!("Provider error: {err}"));
+                return;
+            }
+        };
         self.pending_response = Some(full_response.chars().collect());
         self.streamed_chars = 0;
         self.active_session_mut().messages.push("Auvro: ".to_owned());
         self.stream_line_index = Some(self.active_session().messages.len() - 1);
         self.is_loading = true;
         self.last_stream_tick = Instant::now();
-    }
-
-    fn generate_assistant_reply(&self, prompt: &str) -> String {
-        format!(
-            "Streaming demo response: I received '{prompt}' and this output is rendered token-by-token so the chat feels live."
-        )
     }
 
     fn tick_streaming(&mut self, ctx: &egui::Context) {
