@@ -11,10 +11,49 @@ pub trait Provider {
 }
 
 pub fn create_default_provider() -> Box<dyn Provider> {
-    if let Some(provider) = HackClubProvider::from_env() {
-        Box::new(provider)
-    } else {
-        Box::new(MockProvider)
+    let hackclub = HackClubProvider::from_env().map(|provider| Box::new(provider) as Box<dyn Provider>);
+    let openrouter = OpenRouterProvider::from_env().map(|provider| Box::new(provider) as Box<dyn Provider>);
+
+    match (hackclub, openrouter) {
+        (Some(primary), Some(fallback)) => Box::new(FailoverProvider::new(primary, fallback)),
+        (Some(primary), None) => primary,
+        (None, Some(fallback)) => fallback,
+        (None, None) => Box::new(MockProvider),
+    }
+}
+
+struct FailoverProvider {
+    primary: Box<dyn Provider>,
+    fallback: Box<dyn Provider>,
+}
+
+impl FailoverProvider {
+    fn new(primary: Box<dyn Provider>, fallback: Box<dyn Provider>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl Provider for FailoverProvider {
+    fn name(&self) -> &str {
+        "Failover (HackClub -> OpenRouter)"
+    }
+
+    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+        match self.primary.generate_reply(prompt, conversation) {
+            Ok(reply) => Ok(reply),
+            Err(primary_err) => self
+                .fallback
+                .generate_reply(prompt, conversation)
+                .map_err(|fallback_err| {
+                    format!(
+                        "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}",
+                        self.primary.name(),
+                        primary_err,
+                        self.fallback.name(),
+                        fallback_err
+                    )
+                }),
+        }
     }
 }
 
@@ -155,6 +194,150 @@ impl Provider for HackClubProvider {
 
         body.message_content()
             .ok_or_else(|| "HackClub AI response did not include message content".to_owned())
+    }
+}
+
+pub struct OpenRouterProvider {
+    endpoint: String,
+    api_key: String,
+    model: String,
+    site_url: Option<String>,
+    app_name: Option<String>,
+    client: Client,
+}
+
+impl OpenRouterProvider {
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("OPENROUTER_API_KEY").ok()?.trim().to_owned();
+        if api_key.is_empty() {
+            return None;
+        }
+
+        let endpoint = std::env::var("OPENROUTER_BASE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned())
+            .trim()
+            .to_owned();
+
+        let model = std::env::var("OPENROUTER_MODEL")
+            .unwrap_or_else(|_| "meta-llama/llama-3.1-8b-instruct:free".to_owned())
+            .trim()
+            .to_owned();
+
+        let site_url = std::env::var("OPENROUTER_SITE_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        let app_name = std::env::var("OPENROUTER_APP_NAME")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .ok()?;
+
+        Some(Self {
+            endpoint,
+            api_key,
+            model,
+            site_url,
+            app_name,
+            client,
+        })
+    }
+
+    fn chat_endpoint(&self) -> String {
+        let trimmed = self.endpoint.trim_end_matches('/');
+        if trimmed.ends_with("/chat/completions") {
+            trimmed.to_owned()
+        } else {
+            format!("{trimmed}/chat/completions")
+        }
+    }
+
+    fn conversation_to_messages(&self, prompt: &str, conversation: &[String]) -> Vec<ApiMessage> {
+        let mut messages = Vec::with_capacity(conversation.len() + 2);
+
+        messages.push(ApiMessage {
+            role: "system".to_owned(),
+            content: CORE_SYSTEM_PROMPT.to_owned(),
+        });
+
+        for line in conversation {
+            if let Some(content) = line.strip_prefix("You:") {
+                messages.push(ApiMessage {
+                    role: "user".to_owned(),
+                    content: content.trim().to_owned(),
+                });
+            } else if let Some(content) = line.strip_prefix("Auvro:") {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    messages.push(ApiMessage {
+                        role: "assistant".to_owned(),
+                        content: trimmed.to_owned(),
+                    });
+                }
+            }
+        }
+
+        if !conversation
+            .iter()
+            .any(|line| line.trim_start().starts_with("You:"))
+        {
+            messages.push(ApiMessage {
+                role: "user".to_owned(),
+                content: prompt.to_owned(),
+            });
+        }
+
+        messages
+    }
+}
+
+impl Provider for OpenRouterProvider {
+    fn name(&self) -> &str {
+        "OpenRouter"
+    }
+
+    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+        let payload = ChatRequest {
+            model: &self.model,
+            messages: self.conversation_to_messages(prompt, conversation),
+            temperature: 0.7,
+        };
+
+        let mut request = self
+            .client
+            .post(self.chat_endpoint())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&payload);
+
+        if let Some(site_url) = &self.site_url {
+            request = request.header("HTTP-Referer", site_url);
+        }
+        if let Some(app_name) = &self.app_name {
+            request = request.header("X-Title", app_name);
+        }
+
+        let response = request
+            .send()
+            .map_err(|err| format!("Request failed: {err}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            return Err(format!("OpenRouter request failed ({status}): {text}"));
+        }
+
+        let body: ChatResponse = response
+            .json()
+            .map_err(|err| format!("Could not parse OpenRouter response: {err}"))?;
+
+        body.message_content()
+            .ok_or_else(|| "OpenRouter response did not include message content".to_owned())
     }
 }
 
