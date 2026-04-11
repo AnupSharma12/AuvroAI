@@ -26,9 +26,16 @@ struct AuvroApp {
     auth_notice: Option<String>,
     is_authenticated: bool,
     user_email: Option<String>,
+    user_full_name: Option<String>,
     supabase_url: String,
     supabase_publishable_key: String,
     auth_error: Option<String>,
+    profile_menu_open: bool,
+    settings_open: bool,
+    settings_notice: Option<String>,
+    settings_name_draft: String,
+    settings_email_draft: String,
+    settings_password_draft: String,
     is_loading: bool,
     error_message: Option<String>,
     pending_response: Option<Vec<char>>,
@@ -74,12 +81,15 @@ impl Default for AuvroApp {
             ))
         };
 
-        let (is_authenticated, user_email, auth_notice) =
+        let (is_authenticated, user_email, user_full_name, auth_notice) =
             if auth_error.is_none() && !supabase_url.is_empty() && !supabase_publishable_key.is_empty() {
                 Self::restore_auth_session(&supabase_url, &supabase_publishable_key)
             } else {
-                (false, None, None)
+                (false, None, None, None)
             };
+
+        let settings_name_draft = user_full_name.clone().unwrap_or_default();
+        let settings_email_draft = user_email.clone().unwrap_or_default();
 
         Self {
             provider: create_default_provider(),
@@ -98,9 +108,16 @@ impl Default for AuvroApp {
             auth_notice,
             is_authenticated,
             user_email,
+            user_full_name,
             supabase_url,
             supabase_publishable_key,
             auth_error,
+            profile_menu_open: false,
+            settings_open: false,
+            settings_notice: None,
+            settings_name_draft,
+            settings_email_draft,
+            settings_password_draft: String::new(),
             is_loading: false,
             error_message: None,
             pending_response: None,
@@ -112,26 +129,39 @@ impl Default for AuvroApp {
 }
 
 impl AuvroApp {
-    fn restore_auth_session(url: &str, key: &str) -> (bool, Option<String>, Option<String>) {
+    fn restore_auth_session(
+        url: &str,
+        key: &str,
+    ) -> (bool, Option<String>, Option<String>, Option<String>) {
         let secret_store = SecretStore::new("AuvroAI");
         let Ok(token) = secret_store.get("SUPABASE_ACCESS_TOKEN") else {
-            return (false, None, None);
+            return (false, None, None, None);
         };
 
-        match Self::fetch_user_email(url, key, &token) {
-            Ok(email) => (
+        match Self::fetch_user_profile(url, key, &token) {
+            Ok((email, full_name)) => (
                 true,
                 Some(email),
+                full_name,
                 Some("Session restored. Redirecting to chat.".to_owned()),
             ),
             Err(_) => {
                 let _ = secret_store.delete("SUPABASE_ACCESS_TOKEN");
-                (false, None, Some("Previous session expired. Please log in again.".to_owned()))
+                (
+                    false,
+                    None,
+                    None,
+                    Some("Previous session expired. Please log in again.".to_owned()),
+                )
             }
         }
     }
 
-    fn fetch_user_email(url: &str, key: &str, access_token: &str) -> Result<String, String> {
+    fn fetch_user_profile(
+        url: &str,
+        key: &str,
+        access_token: &str,
+    ) -> Result<(String, Option<String>), String> {
         let endpoint = format!("{}/auth/v1/user", url.trim_end_matches('/'));
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(8))
@@ -150,10 +180,302 @@ impl AuvroApp {
         }
 
         let body: serde_json::Value = response.json().map_err(|e| e.to_string())?;
-        body.get("email")
+        let email = body
+            .get("email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
-            .ok_or_else(|| "User email missing in Supabase response".to_owned())
+            .ok_or_else(|| "User email missing in Supabase response".to_owned())?;
+
+        let full_name = Self::extract_full_name(&body);
+        Ok((email, full_name))
+    }
+
+    fn extract_full_name(body: &serde_json::Value) -> Option<String> {
+        body.get("user_metadata")
+            .and_then(|m| m.get("full_name"))
+            .and_then(|v| v.as_str())
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    }
+
+    fn access_token(&self) -> Result<String, String> {
+        SecretStore::new("AuvroAI")
+            .get("SUPABASE_ACCESS_TOKEN")
+            .map_err(|_| "Missing auth session token. Please log in again.".to_owned())
+    }
+
+    fn update_supabase_user(
+        &self,
+        access_token: &str,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let endpoint = format!("{}/auth/v1/user", self.supabase_url.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .build()
+            .map_err(|err| err.to_string())?;
+
+        let response = client
+            .put(endpoint)
+            .header("apikey", &self.supabase_publishable_key)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Content-Type", "application/json")
+            .json(payload)
+            .send()
+            .map_err(|err| err.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            return Err(format!("Update failed ({status}): {text}"));
+        }
+
+        response.json().map_err(|err| err.to_string())
+    }
+
+    fn save_profile_name(&mut self) {
+        let full_name = self.settings_name_draft.trim().to_owned();
+        if full_name.is_empty() {
+            self.settings_notice = Some("Name cannot be empty.".to_owned());
+            return;
+        }
+
+        let access_token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_notice = Some(err);
+                return;
+            }
+        };
+
+        let payload = serde_json::json!({
+            "data": { "full_name": full_name },
+        });
+
+        match self.update_supabase_user(&access_token, &payload) {
+            Ok(body) => {
+                self.user_full_name = Self::extract_full_name(&body);
+                if self.user_full_name.is_none() {
+                    self.user_full_name = Some(self.settings_name_draft.trim().to_owned());
+                }
+                self.settings_notice = Some("Profile name updated.".to_owned());
+            }
+            Err(err) => self.settings_notice = Some(err),
+        }
+    }
+
+    fn change_account_email(&mut self) {
+        let email = self.settings_email_draft.trim().to_owned();
+        if email.is_empty() || !email.contains('@') {
+            self.settings_notice = Some("Enter a valid email address.".to_owned());
+            return;
+        }
+
+        let access_token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_notice = Some(err);
+                return;
+            }
+        };
+
+        let payload = serde_json::json!({ "email": email });
+
+        match self.update_supabase_user(&access_token, &payload) {
+            Ok(body) => {
+                self.user_email = body
+                    .get("email")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_owned())
+                    .or_else(|| Some(self.settings_email_draft.trim().to_owned()));
+                self.settings_notice = Some(
+                    "Email update requested. Supabase may require email verification.".to_owned(),
+                );
+            }
+            Err(err) => self.settings_notice = Some(err),
+        }
+    }
+
+    fn change_account_password(&mut self) {
+        let password = self.settings_password_draft.clone();
+        if password.trim().len() < 6 {
+            self.settings_notice = Some("Password must be at least 6 characters.".to_owned());
+            return;
+        }
+
+        let access_token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_notice = Some(err);
+                return;
+            }
+        };
+
+        let payload = serde_json::json!({ "password": password });
+
+        match self.update_supabase_user(&access_token, &payload) {
+            Ok(_) => {
+                self.settings_password_draft.clear();
+                self.settings_notice = Some("Password changed successfully.".to_owned());
+            }
+            Err(err) => self.settings_notice = Some(err),
+        }
+    }
+
+    fn profile_initials(&self) -> String {
+        if let Some(full_name) = &self.user_full_name {
+            let mut parts = full_name.split_whitespace();
+            if let Some(first) = parts.next() {
+                let first_char = first.chars().next().unwrap_or('U');
+                if let Some(last) = parts.last() {
+                    let second_char = last.chars().next().unwrap_or(first_char);
+                    return format!(
+                        "{}{}",
+                        first_char.to_ascii_uppercase(),
+                        second_char.to_ascii_uppercase()
+                    );
+                }
+
+                return first_char.to_ascii_uppercase().to_string();
+            }
+        }
+
+        self.user_email
+            .as_deref()
+            .and_then(|email| email.chars().next())
+            .map(|ch| ch.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "U".to_owned())
+    }
+
+    fn render_profile_avatar(ui: &mut egui::Ui, initials: &str, radius: f32) {
+        let size = egui::vec2(radius * 2.0, radius * 2.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), radius, egui::Color32::from_rgb(58, 86, 124));
+        painter.circle_stroke(
+            rect.center(),
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 44, 78)),
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            initials,
+            egui::FontId::proportional(radius * 0.72),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn render_account_menu(&mut self, ctx: &egui::Context) {
+        if !self.profile_menu_open {
+            return;
+        }
+
+        egui::Window::new("Account")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.label(self.user_full_name.as_deref().unwrap_or("AuvroAI User"));
+                if let Some(email) = &self.user_email {
+                    ui.small(email);
+                }
+                ui.separator();
+
+                if ui.button("Settings").clicked() {
+                    self.settings_open = true;
+                    self.profile_menu_open = false;
+                    self.settings_notice = None;
+                }
+
+                if ui.button("Log Out").clicked() {
+                    self.profile_menu_open = false;
+                    self.logout();
+                }
+
+                if ui.button("Close").clicked() {
+                    self.profile_menu_open = false;
+                }
+            });
+    }
+
+    fn render_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let initials = self.profile_initials();
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    Self::render_profile_avatar(ui, &initials, 28.0);
+                    ui.vertical(|ui| {
+                        ui.label(self.user_full_name.as_deref().unwrap_or("AuvroAI User"));
+                        if let Some(email) = &self.user_email {
+                            ui.small(email);
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label("Name");
+                ui.add_sized(
+                    [420.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.settings_name_draft)
+                        .hint_text("Your name"),
+                );
+                if ui.button("Save Name").clicked() {
+                    self.save_profile_name();
+                }
+
+                ui.add_space(10.0);
+                ui.label("Email");
+                ui.add_sized(
+                    [420.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.settings_email_draft)
+                        .hint_text("you@example.com"),
+                );
+                if ui.button("Change Email").clicked() {
+                    self.change_account_email();
+                }
+
+                ui.add_space(10.0);
+                ui.label("New Password");
+                ui.add_sized(
+                    [420.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.settings_password_draft)
+                        .password(true)
+                        .hint_text("Enter new password"),
+                );
+                if ui.button("Change Password").clicked() {
+                    self.change_account_password();
+                }
+
+                if let Some(notice) = &self.settings_notice {
+                    ui.add_space(8.0);
+                    let is_error = notice.to_ascii_lowercase().contains("failed")
+                        || notice.to_ascii_lowercase().contains("missing")
+                        || notice.to_ascii_lowercase().contains("valid")
+                        || notice.to_ascii_lowercase().contains("least");
+                    let color = if is_error {
+                        egui::Color32::from_rgb(255, 99, 99)
+                    } else {
+                        egui::Color32::from_rgb(48, 146, 85)
+                    };
+                    ui.colored_label(color, notice);
+                }
+
+                ui.add_space(10.0);
+                if ui.button("Close Settings").clicked() {
+                    self.settings_open = false;
+                }
+            });
     }
 
     fn login_with_email(&mut self) {
@@ -228,12 +550,26 @@ impl AuvroApp {
             .and_then(|v| v.as_str())
             .unwrap_or(self.auth_email.trim())
             .to_owned();
+        let user_full_name = payload
+            .get("user")
+            .and_then(Self::extract_full_name)
+            .or_else(|| {
+                let name = self.auth_full_name.trim().to_owned();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            });
 
         let secret_store = SecretStore::new("AuvroAI");
         let _ = secret_store.set("SUPABASE_ACCESS_TOKEN", &access_token);
 
         self.is_authenticated = true;
         self.user_email = Some(user_email.clone());
+        self.user_full_name = user_full_name;
+        self.settings_email_draft = user_email.clone();
+        self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
         self.auth_password.clear();
         self.auth_notice = Some(format!("Logged in as {user_email}"));
     }
@@ -313,11 +649,18 @@ impl AuvroApp {
                 .and_then(|v| v.as_str())
                 .unwrap_or(self.auth_email.trim())
                 .to_owned();
+            let user_full_name = payload
+                .get("user")
+                .and_then(Self::extract_full_name)
+                .or_else(|| Some(full_name.clone()));
             let secret_store = SecretStore::new("AuvroAI");
             let _ = secret_store.set("SUPABASE_ACCESS_TOKEN", &access_token);
 
             self.is_authenticated = true;
             self.user_email = Some(user_email.clone());
+            self.user_full_name = user_full_name;
+            self.settings_email_draft = user_email.clone();
+            self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
             self.auth_password.clear();
             self.auth_confirm_password.clear();
             self.auth_notice = Some(format!("Signup successful. Logged in as {user_email}"));
@@ -333,6 +676,13 @@ impl AuvroApp {
         let _ = secret_store.delete("SUPABASE_ACCESS_TOKEN");
         self.is_authenticated = false;
         self.user_email = None;
+        self.user_full_name = None;
+        self.profile_menu_open = false;
+        self.settings_open = false;
+        self.settings_notice = None;
+        self.settings_name_draft.clear();
+        self.settings_email_draft.clear();
+        self.settings_password_draft.clear();
         self.auth_password.clear();
         self.auth_confirm_password.clear();
         self.auth_notice = Some("Logged out.".to_owned());
@@ -727,9 +1077,19 @@ impl eframe::App for AuvroApp {
                         .as_deref()
                         .unwrap_or("authenticated user");
                     ui.label(format!("Signed in: {email}"));
-                    if ui.button("Log Out").clicked() {
-                        self.logout();
-                    }
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let initials = self.profile_initials();
+                            let button = egui::Button::new(initials)
+                                .min_size(egui::vec2(34.0, 34.0))
+                                .corner_radius(egui::CornerRadius::same(17));
+                            if ui.add(button).clicked() {
+                                self.profile_menu_open = true;
+                            }
+                        },
+                    );
                 }
             });
         });
@@ -785,6 +1145,9 @@ impl eframe::App for AuvroApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_chat_panel(ui);
         });
+
+        self.render_account_menu(ctx);
+        self.render_settings_window(ctx);
     }
 }
 
