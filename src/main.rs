@@ -2,7 +2,7 @@ mod secrets;
 mod provider;
 
 use eframe::egui;
-use provider::{MockProvider, Provider};
+use provider::{create_default_provider, Provider};
 use secrets::SecretStore;
 use std::time::{Duration, Instant};
 
@@ -81,11 +81,11 @@ impl Default for AuvroApp {
             };
 
         Self {
-            provider: Box::new(MockProvider),
+            provider: create_default_provider(),
             draft_message: String::new(),
             sessions: vec![ChatSession {
                 name: "General".to_owned(),
-                messages: vec!["Auvro: Welcome to AuvroAI. How can I help you today?".to_owned()],
+                messages: vec!["Auvro: Welcome to Auvro AI. How can I help you today?".to_owned()],
             }],
             selected_session: 0,
             renaming_session: false,
