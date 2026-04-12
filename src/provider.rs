@@ -140,17 +140,17 @@ pub struct HackClubProvider {
 
 impl HackClubProvider {
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("AUVRO_API_KEY").ok()?.trim().to_owned();
-        let endpoint = std::env::var("AUVRO_ENDPOINT").ok()?.trim().to_owned();
+        let api_key = crate::env::AUVRO_API_KEY.trim().to_owned();
+        let endpoint = crate::env::AUVRO_ENDPOINT.trim().to_owned();
 
         if api_key.is_empty() || endpoint.is_empty() {
             return None;
         }
 
-        let model = std::env::var("AUVRO_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-oss-120b".to_owned())
-            .trim()
-            .to_owned();
+        let model = crate::env::AUVRO_MODEL.trim().to_owned();
+        if model.is_empty() {
+            return None;
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -236,20 +236,20 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY").ok()?.trim().to_owned();
+        let api_key = crate::env::OPENROUTER_API_KEY.trim().to_owned();
         if api_key.is_empty() {
             return None;
         }
 
-        let endpoint = std::env::var("OPENROUTER_BASE_URL")
-            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_owned())
-            .trim()
-            .to_owned();
+        let endpoint = crate::env::OPENROUTER_BASE_URL.trim().to_owned();
+        if endpoint.is_empty() {
+            return None;
+        }
 
-        let model = std::env::var("OPENROUTER_MODEL")
-            .unwrap_or_else(|_| "meta-llama/llama-3.1-8b-instruct:free".to_owned())
-            .trim()
-            .to_owned();
+        let model = crate::env::OPENROUTER_MODEL.trim().to_owned();
+        if model.is_empty() {
+            return None;
+        }
 
         let site_url = std::env::var("OPENROUTER_SITE_URL")
             .ok()

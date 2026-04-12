@@ -1,8 +1,12 @@
 mod chat_pipeline;
+mod cache;
+mod env;
 mod secrets;
 mod provider;
+mod ui;
 
 use eframe::egui;
+use cache::model_metadata::ModelMetadataCache;
 use provider::{create_default_provider, Provider};
 use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
@@ -20,81 +24,71 @@ struct SessionRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MessageRecord {
-    id: Option<String>,
-    session_id: Option<String>,
-    role: String,
-    content: String,
-    created_at: Option<String>,
+pub(crate) struct MessageRecord {
+    pub(crate) id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) role: String,
+    pub(crate) content: String,
+    pub(crate) created_at: Option<String>,
 }
 
-struct ChatSession {
-    id: String,
-    name: String,
-    messages: Vec<MessageRecord>,
+pub(crate) struct ChatSession {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) messages: Vec<MessageRecord>,
 }
 
-struct AuvroApp {
-    provider: Box<dyn Provider>,
-    draft_message: String,
-    sessions: Vec<ChatSession>,
-    selected_session: Option<usize>,
-    creating_new_chat: bool,
-    renaming_session: bool,
-    auth_mode: AuthMode,
-    auth_full_name: String,
-    auth_email: String,
-    auth_password: String,
-    auth_confirm_password: String,
-    auth_notice: Option<String>,
-    is_authenticated: bool,
-    session_access_token: Option<String>,
-    user_id: Option<String>,
-    user_email: Option<String>,
-    user_full_name: Option<String>,
-    supabase_url: String,
-    supabase_publishable_key: String,
-    auth_error: Option<String>,
-    profile_menu_open: bool,
-    settings_open: bool,
-    settings_notice: Option<String>,
-    settings_name_draft: String,
-    settings_email_draft: String,
-    settings_password_draft: String,
-    is_loading: bool,
-    error_message: Option<String>,
-    pending_response: Option<Vec<char>>,
-    streamed_chars: usize,
-    stream_session_index: Option<usize>,
-    stream_line_index: Option<usize>,
-    last_stream_tick: Instant,
+pub(crate) struct AuvroApp {
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) draft_message: String,
+    pub(crate) sessions: Vec<ChatSession>,
+    pub(crate) selected_session: Option<usize>,
+    pub(crate) creating_new_chat: bool,
+    pub(crate) renaming_session: bool,
+    pub(crate) auth_mode: AuthMode,
+    pub(crate) auth_full_name: String,
+    pub(crate) auth_email: String,
+    pub(crate) auth_password: String,
+    pub(crate) auth_confirm_password: String,
+    pub(crate) auth_notice: Option<String>,
+    pub(crate) is_authenticated: bool,
+    pub(crate) session_access_token: Option<String>,
+    pub(crate) user_id: Option<String>,
+    pub(crate) user_email: Option<String>,
+    pub(crate) user_full_name: Option<String>,
+    pub(crate) auth_error: Option<String>,
+    pub(crate) profile_menu_open: bool,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_notice: Option<String>,
+    pub(crate) settings_name_draft: String,
+    pub(crate) settings_email_draft: String,
+    pub(crate) settings_password_draft: String,
+    pub(crate) selected_model_id: String,
+    pub(crate) model_cache: ModelMetadataCache,
+    pub(crate) is_loading: bool,
+    pub(crate) error_message: Option<String>,
+    pub(crate) pending_response: Option<Vec<char>>,
+    pub(crate) streamed_chars: usize,
+    pub(crate) stream_session_index: Option<usize>,
+    pub(crate) stream_line_index: Option<usize>,
+    pub(crate) last_stream_tick: Instant,
 }
+
+pub(crate) type AppState = AuvroApp;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AuthMode {
+pub(crate) enum AuthMode {
     Login,
     SignUp,
 }
 
 impl Default for AuvroApp {
     fn default() -> Self {
-        let secret_store = SecretStore::new("AuvroAI");
-        let supabase_url = std::env::var("SUPABASE_URL").unwrap_or_default();
-
-        let mut supabase_publishable_key = std::env::var("SUPABASE_PUBLISHABLE_KEY").unwrap_or_default();
-        if supabase_publishable_key.trim().is_empty() {
-            if let Ok(stored_key) = secret_store.get("SUPABASE_PUBLISHABLE_KEY") {
-                supabase_publishable_key = stored_key;
-            }
-        } else {
-            let _ = secret_store.set("SUPABASE_PUBLISHABLE_KEY", &supabase_publishable_key);
-        }
-
         let mut missing = Vec::new();
-        if supabase_url.trim().is_empty() {
+        if crate::env::SUPABASE_URL.trim().is_empty() {
             missing.push("SUPABASE_URL");
         }
-        if supabase_publishable_key.trim().is_empty() {
+        if crate::env::SUPABASE_PUBLISHABLE_KEY.trim().is_empty() {
             missing.push("SUPABASE_PUBLISHABLE_KEY");
         }
 
@@ -108,8 +102,14 @@ impl Default for AuvroApp {
         };
 
         let (is_authenticated, user_id, user_email, user_full_name, auth_notice) =
-            if auth_error.is_none() && !supabase_url.is_empty() && !supabase_publishable_key.is_empty() {
-                Self::restore_auth_session(&supabase_url, &supabase_publishable_key)
+            if auth_error.is_none()
+                && !crate::env::SUPABASE_URL.is_empty()
+                && !crate::env::SUPABASE_PUBLISHABLE_KEY.is_empty()
+            {
+                Self::restore_auth_session(
+                    crate::env::SUPABASE_URL,
+                    crate::env::SUPABASE_PUBLISHABLE_KEY,
+                )
             } else {
                 (false, None, None, None, None)
             };
@@ -122,8 +122,8 @@ impl Default for AuvroApp {
                 session_access_token = Some(access_token.clone());
                 if let Some(uid) = user_id.as_deref() {
                     if let Ok(rows) = Self::fetch_sessions(
-                        &supabase_url,
-                        &supabase_publishable_key,
+                        crate::env::SUPABASE_URL,
+                        crate::env::SUPABASE_PUBLISHABLE_KEY,
                         &access_token,
                         uid,
                     ) {
@@ -140,8 +140,8 @@ impl Default for AuvroApp {
                             selected_session = Some(0);
                             let first_session_id = sessions[0].id.clone();
                             if let Ok(messages) = Self::fetch_messages(
-                                &supabase_url,
-                                &supabase_publishable_key,
+                                crate::env::SUPABASE_URL,
+                                crate::env::SUPABASE_PUBLISHABLE_KEY,
                                 &access_token,
                                 &first_session_id,
                             ) {
@@ -155,6 +155,7 @@ impl Default for AuvroApp {
 
         let settings_name_draft = user_full_name.clone().unwrap_or_default();
         let settings_email_draft = user_email.clone().unwrap_or_default();
+        let selected_model_id = crate::env::OPENROUTER_MODEL.to_owned();
 
         Self {
             provider: create_default_provider(),
@@ -174,8 +175,6 @@ impl Default for AuvroApp {
             user_id,
             user_email,
             user_full_name,
-            supabase_url,
-            supabase_publishable_key,
             auth_error,
             profile_menu_open: false,
             settings_open: false,
@@ -183,6 +182,8 @@ impl Default for AuvroApp {
             settings_name_draft,
             settings_email_draft,
             settings_password_draft: String::new(),
+            selected_model_id,
+            model_cache: ModelMetadataCache::new(Duration::from_secs(600)),
             is_loading: false,
             error_message: None,
             pending_response: None,
@@ -466,7 +467,7 @@ impl AuvroApp {
         access_token: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let endpoint = format!("{}/auth/v1/user", self.supabase_url.trim_end_matches('/'));
+        let endpoint = format!("{}/auth/v1/user", crate::env::SUPABASE_URL.trim_end_matches('/'));
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -474,7 +475,7 @@ impl AuvroApp {
 
         let response = client
             .put(endpoint)
-            .header("apikey", &self.supabase_publishable_key)
+            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
             .header("Authorization", format!("Bearer {access_token}"))
             .header("Content-Type", "application/json")
             .json(payload)
@@ -490,7 +491,45 @@ impl AuvroApp {
         response.json().map_err(|err| err.to_string())
     }
 
-    fn save_profile_name(&mut self) {
+    pub(crate) fn save_selected_model_id(&self) -> Result<(), String> {
+        let user_id = self
+            .user_id
+            .as_deref()
+            .ok_or_else(|| "Missing user id. Please log in again.".to_owned())?;
+        let access_token = self.access_token()?;
+
+        let endpoint = format!(
+            "{}/rest/v1/user_settings",
+            crate::env::SUPABASE_URL.trim_end_matches('/')
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let response = client
+            .post(endpoint)
+            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&serde_json::json!({
+                "user_id": user_id,
+                "selected_model_id": self.selected_model_id,
+            }))
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            return Err(format!("Failed to save selected model ({status}): {text}"));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn save_profile_name(&mut self) {
         let full_name = self.settings_name_draft.trim().to_owned();
         if full_name.is_empty() {
             self.settings_notice = Some("Name cannot be empty.".to_owned());
@@ -521,7 +560,7 @@ impl AuvroApp {
         }
     }
 
-    fn change_account_email(&mut self) {
+    pub(crate) fn change_account_email(&mut self) {
         let email = self.settings_email_draft.trim().to_owned();
         if email.is_empty() || !email.contains('@') {
             self.settings_notice = Some("Enter a valid email address.".to_owned());
@@ -553,7 +592,7 @@ impl AuvroApp {
         }
     }
 
-    fn change_account_password(&mut self) {
+    pub(crate) fn change_account_password(&mut self) {
         let password = self.settings_password_draft.clone();
         if password.trim().len() < 6 {
             self.settings_notice = Some("Password must be at least 6 characters.".to_owned());
@@ -579,7 +618,7 @@ impl AuvroApp {
         }
     }
 
-    fn profile_initials(&self) -> String {
+    pub(crate) fn profile_initials(&self) -> String {
         if let Some(full_name) = &self.user_full_name {
             let mut parts = full_name.split_whitespace();
             if let Some(first) = parts.next() {
@@ -604,7 +643,7 @@ impl AuvroApp {
             .unwrap_or_else(|| "U".to_owned())
     }
 
-    fn render_profile_avatar(ui: &mut egui::Ui, initials: &str, radius: f32) {
+    pub(crate) fn render_profile_avatar(ui: &mut egui::Ui, initials: &str, radius: f32) {
         let size = egui::vec2(radius * 2.0, radius * 2.0);
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let painter = ui.painter();
@@ -624,118 +663,14 @@ impl AuvroApp {
     }
 
     fn render_account_menu(&mut self, ctx: &egui::Context) {
-        if !self.profile_menu_open {
-            return;
-        }
-
-        egui::Window::new("Account")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                ui.label(self.user_full_name.as_deref().unwrap_or("AuvroAI User"));
-                if let Some(email) = &self.user_email {
-                    ui.small(email);
-                }
-                ui.separator();
-
-                if ui.button("Settings").clicked() {
-                    self.settings_open = true;
-                    self.profile_menu_open = false;
-                    self.settings_notice = None;
-                }
-
-                if ui.button("Log Out").clicked() {
-                    self.profile_menu_open = false;
-                    self.logout();
-                }
-
-                if ui.button("Close").clicked() {
-                    self.profile_menu_open = false;
-                }
-            });
+        ui::settings::render_account_menu(self, ctx);
     }
 
     fn render_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-
-        let initials = self.profile_initials();
-        egui::Window::new("Settings")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(460.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    Self::render_profile_avatar(ui, &initials, 28.0);
-                    ui.vertical(|ui| {
-                        ui.label(self.user_full_name.as_deref().unwrap_or("AuvroAI User"));
-                        if let Some(email) = &self.user_email {
-                            ui.small(email);
-                        }
-                    });
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                ui.label("Name");
-                ui.add_sized(
-                    [420.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.settings_name_draft)
-                        .hint_text("Your name"),
-                );
-                if ui.button("Save Name").clicked() {
-                    self.save_profile_name();
-                }
-
-                ui.add_space(10.0);
-                ui.label("Email");
-                ui.add_sized(
-                    [420.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.settings_email_draft)
-                        .hint_text("you@example.com"),
-                );
-                if ui.button("Change Email").clicked() {
-                    self.change_account_email();
-                }
-
-                ui.add_space(10.0);
-                ui.label("New Password");
-                ui.add_sized(
-                    [420.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.settings_password_draft)
-                        .password(true)
-                        .hint_text("Enter new password"),
-                );
-                if ui.button("Change Password").clicked() {
-                    self.change_account_password();
-                }
-
-                if let Some(notice) = &self.settings_notice {
-                    ui.add_space(8.0);
-                    let is_error = notice.to_ascii_lowercase().contains("failed")
-                        || notice.to_ascii_lowercase().contains("missing")
-                        || notice.to_ascii_lowercase().contains("valid")
-                        || notice.to_ascii_lowercase().contains("least");
-                    let color = if is_error {
-                        egui::Color32::from_rgb(255, 99, 99)
-                    } else {
-                        egui::Color32::from_rgb(48, 146, 85)
-                    };
-                    ui.colored_label(color, notice);
-                }
-
-                ui.add_space(10.0);
-                if ui.button("Close Settings").clicked() {
-                    self.settings_open = false;
-                }
-            });
+        ui::settings::render_settings_window(self, ctx);
     }
 
-    fn login_with_email(&mut self) {
+    pub(crate) fn login_with_email(&mut self) {
         let email = self.auth_email.trim().to_owned();
         let password = self.auth_password.clone();
 
@@ -746,7 +681,7 @@ impl AuvroApp {
 
         let endpoint = format!(
             "{}/auth/v1/token?grant_type=password",
-            self.supabase_url.trim_end_matches('/')
+            crate::env::SUPABASE_URL.trim_end_matches('/')
         );
 
         let client = match reqwest::blocking::Client::builder()
@@ -762,7 +697,7 @@ impl AuvroApp {
 
         let response = client
             .post(endpoint)
-            .header("apikey", &self.supabase_publishable_key)
+            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "email": email, "password": password }))
             .send();
@@ -838,8 +773,8 @@ impl AuvroApp {
         self.selected_session = None;
         if let Some(uid) = user_id {
             if let Ok(rows) = Self::fetch_sessions(
-                &self.supabase_url,
-                &self.supabase_publishable_key,
+                crate::env::SUPABASE_URL,
+                crate::env::SUPABASE_PUBLISHABLE_KEY,
                 &access_token,
                 &uid,
             ) {
@@ -861,7 +796,7 @@ impl AuvroApp {
         self.auth_notice = Some(format!("Logged in as {user_email}"));
     }
 
-    fn signup_with_email(&mut self) {
+    pub(crate) fn signup_with_email(&mut self) {
         let full_name = self.auth_full_name.trim().to_owned();
         let email = self.auth_email.trim().to_owned();
         let password = self.auth_password.clone();
@@ -877,7 +812,10 @@ impl AuvroApp {
             return;
         }
 
-        let endpoint = format!("{}/auth/v1/signup", self.supabase_url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/auth/v1/signup",
+            crate::env::SUPABASE_URL.trim_end_matches('/')
+        );
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -891,7 +829,7 @@ impl AuvroApp {
 
         let response = client
             .post(endpoint)
-            .header("apikey", &self.supabase_publishable_key)
+            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "email": email,
@@ -968,7 +906,7 @@ impl AuvroApp {
         }
     }
 
-    fn logout(&mut self) {
+    pub(crate) fn logout(&mut self) {
         let secret_store = SecretStore::new("AuvroAI");
         let _ = secret_store.delete("SUPABASE_ACCESS_TOKEN");
         self.is_authenticated = false;
@@ -985,128 +923,10 @@ impl AuvroApp {
         self.settings_name_draft.clear();
         self.settings_email_draft.clear();
         self.settings_password_draft.clear();
+        self.selected_model_id.clear();
         self.auth_password.clear();
         self.auth_confirm_password.clear();
         self.auth_notice = Some("Logged out.".to_owned());
-    }
-
-    fn render_auth_panel(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(24.0);
-            ui.heading("Welcome to AuvroAI");
-            ui.label("Log in or sign up with your email account.");
-            ui.add_space(16.0);
-
-            ui.horizontal(|ui| {
-                let login_selected = self.auth_mode == AuthMode::Login;
-                if ui.selectable_label(login_selected, "Log In").clicked() {
-                    self.auth_mode = AuthMode::Login;
-                    self.auth_notice = None;
-                }
-
-                let signup_selected = self.auth_mode == AuthMode::SignUp;
-                if ui.selectable_label(signup_selected, "Sign Up").clicked() {
-                    self.auth_mode = AuthMode::SignUp;
-                    self.auth_notice = None;
-                }
-            });
-
-            ui.add_space(12.0);
-
-            if self.auth_mode == AuthMode::SignUp {
-                ui.label("Full Name");
-                ui.add_sized(
-                    [380.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.auth_full_name).hint_text("Your full name"),
-                );
-                ui.add_space(8.0);
-            }
-
-            ui.label("Email");
-            ui.add_sized(
-                [380.0, 30.0],
-                egui::TextEdit::singleline(&mut self.auth_email).hint_text("you@example.com"),
-            );
-
-            ui.add_space(8.0);
-            ui.label("Password");
-            ui.add_sized(
-                [380.0, 30.0],
-                egui::TextEdit::singleline(&mut self.auth_password)
-                    .password(true)
-                    .hint_text("Enter your password"),
-            );
-
-            if self.auth_mode == AuthMode::SignUp {
-                ui.add_space(8.0);
-                ui.label("Confirm Password");
-                ui.add_sized(
-                    [380.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.auth_confirm_password)
-                        .password(true)
-                        .hint_text("Re-enter your password"),
-                );
-            }
-
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let auth_ready = self.auth_error.is_none()
-                    && !self.supabase_url.trim().is_empty()
-                    && !self.supabase_publishable_key.trim().is_empty();
-
-                match self.auth_mode {
-                    AuthMode::Login => {
-                        if ui.button("Log In").clicked() {
-                            if auth_ready {
-                                self.login_with_email();
-                            } else {
-                                self.auth_notice = Some(
-                                    self.auth_error.clone().unwrap_or_else(|| {
-                                        "Supabase is not configured. Set SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in .env."
-                                            .to_owned()
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                    AuthMode::SignUp => {
-                        if ui.button("Sign Up").clicked() {
-                            if auth_ready {
-                                self.signup_with_email();
-                            } else {
-                                self.auth_notice = Some(
-                                    self.auth_error.clone().unwrap_or_else(|| {
-                                        "Supabase is not configured. Set SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in .env."
-                                            .to_owned()
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-            });
-
-            if let Some(notice) = &self.auth_notice {
-                ui.add_space(10.0);
-                let color = if notice.to_ascii_lowercase().contains("failed")
-                    || notice.to_ascii_lowercase().contains("required")
-                {
-                    egui::Color32::from_rgb(255, 99, 99)
-                } else {
-                    egui::Color32::from_rgb(48, 146, 85)
-                };
-                ui.colored_label(color, notice);
-            }
-        });
-    }
-
-    fn active_session(&self) -> Option<&ChatSession> {
-        self.selected_session.and_then(|idx| self.sessions.get(idx))
-    }
-
-    fn active_session_mut(&mut self) -> Option<&mut ChatSession> {
-        self.selected_session
-            .and_then(|idx| self.sessions.get_mut(idx))
     }
 
     fn as_conversation_lines(messages: &[MessageRecord]) -> Vec<String> {
@@ -1161,7 +981,7 @@ impl AuvroApp {
         format!("local-{millis}")
     }
 
-    fn sidebar_title(title: &str) -> String {
+    pub(crate) fn sidebar_title(title: &str) -> String {
         const MAX_CHARS: usize = 28;
         if title.chars().count() <= MAX_CHARS {
             return title.to_owned();
@@ -1170,7 +990,7 @@ impl AuvroApp {
         format!("{trimmed}...")
     }
 
-    fn load_selected_session_messages(&mut self) {
+    pub(crate) fn load_selected_session_messages(&mut self) {
         let Some(idx) = self.selected_session else {
             return;
         };
@@ -1191,8 +1011,8 @@ impl AuvroApp {
         };
 
         match Self::fetch_messages(
-            &self.supabase_url,
-            &self.supabase_publishable_key,
+            crate::env::SUPABASE_URL,
+            crate::env::SUPABASE_PUBLISHABLE_KEY,
             &access_token,
             &session_id,
         ) {
@@ -1220,8 +1040,8 @@ impl AuvroApp {
         let title = Self::normalize_title(&raw_title);
 
         match Self::insert_session(
-            &self.supabase_url,
-            &self.supabase_publishable_key,
+            crate::env::SUPABASE_URL,
+            crate::env::SUPABASE_PUBLISHABLE_KEY,
             &access_token,
             &uid,
             &title,
@@ -1270,16 +1090,16 @@ impl AuvroApp {
 
         let access_token = self.access_token()?;
         Self::insert_message(
-            &self.supabase_url,
-            &self.supabase_publishable_key,
+            crate::env::SUPABASE_URL,
+            crate::env::SUPABASE_PUBLISHABLE_KEY,
             &access_token,
             session_id,
             role,
             content,
         )?;
         Self::touch_session(
-            &self.supabase_url,
-            &self.supabase_publishable_key,
+            crate::env::SUPABASE_URL,
+            crate::env::SUPABASE_PUBLISHABLE_KEY,
             &access_token,
             session_id,
         )
@@ -1295,7 +1115,7 @@ impl AuvroApp {
         self.selected_session = Some(0);
     }
 
-    fn send_message(&mut self) {
+    pub(crate) fn send_message(&mut self) {
         if self.is_loading {
             return;
         }
@@ -1412,138 +1232,6 @@ impl AuvroApp {
         }
     }
 
-    fn render_sessions(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("+ New Chat").clicked() {
-                self.selected_session = None;
-                self.creating_new_chat = true;
-                self.error_message = None;
-                self.renaming_session = false;
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.heading("Chats");
-        ui.add_space(8.0);
-
-        for idx in 0..self.sessions.len() {
-            let selected = self.selected_session == Some(idx);
-            let label = Self::sidebar_title(&self.sessions[idx].name);
-
-            if ui
-                .add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::Button::new(label).selected(selected),
-                )
-                .clicked()
-            {
-                self.selected_session = Some(idx);
-                self.creating_new_chat = false;
-                self.load_selected_session_messages();
-            }
-            ui.add_space(4.0);
-        }
-    }
-
-    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(70.0);
-            ui.heading("AuvroAI");
-            ui.label("What can I help you with today?");
-            ui.add_space(16.0);
-
-            if ui.button("New Chat").clicked() {
-                self.creating_new_chat = true;
-                self.selected_session = None;
-            }
-
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                for suggestion in [
-                    "Summarize a long article",
-                    "Draft a professional email",
-                    "Plan my learning roadmap",
-                ] {
-                    if ui.button(suggestion).clicked() {
-                        self.creating_new_chat = true;
-                        self.selected_session = None;
-                        self.draft_message = suggestion.to_owned();
-                    }
-                }
-            });
-        });
-    }
-
-    fn render_chat_panel(&mut self, ui: &mut egui::Ui) {
-        if self.sessions.is_empty() && !self.creating_new_chat {
-            self.render_empty_state(ui);
-            return;
-        }
-
-        let session_name = self
-            .active_session()
-            .map(|s| s.name.as_str())
-            .unwrap_or("New Chat");
-
-        ui.heading(format!("Chat - {session_name}"));
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        egui::ScrollArea::vertical()
-            .id_salt("chat_scroll")
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                if let Some(session) = self.active_session() {
-                    for message in &session.messages {
-                        let prefix = if message.role == "user" { "You" } else { "Auvro" };
-                        ui.label(format!("{prefix}: {}", message.content));
-                    }
-                }
-            });
-
-        ui.add_space(8.0);
-        if self.is_loading {
-            ui.colored_label(egui::Color32::from_rgb(255, 196, 61), "Auvro is typing...");
-        }
-
-        if let Some(error) = &self.error_message {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 99, 99),
-                format!("error: {error}"),
-            );
-            if ui.button("Clear Error").clicked() {
-                self.error_message = None;
-            }
-        }
-
-        ui.add_space(12.0);
-        ui.label("Message");
-        let editor = ui.add(
-            egui::TextEdit::multiline(&mut self.draft_message)
-                .desired_rows(4)
-                .hint_text("Type your message..."),
-        );
-
-        let (enter_pressed, shift_held) =
-            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
-        if editor.has_focus() && enter_pressed && !shift_held {
-            self.draft_message = self.draft_message.trim_end_matches('\n').to_owned();
-            self.send_message();
-        }
-
-        let send_clicked = ui
-            .add_enabled(
-                !self.is_loading
-                    && self.auth_error.is_none()
-                    && !self.supabase_publishable_key.trim().is_empty(),
-                egui::Button::new("Send"),
-            )
-            .clicked();
-        if send_clicked {
-            self.send_message();
-        }
-    }
 }
 
 impl eframe::App for AuvroApp {
@@ -1655,57 +1343,24 @@ impl eframe::App for AuvroApp {
 
         if !self.is_authenticated {
             egui::CentralPanel::default().show(ctx, |ui| {
-                self.render_auth_panel(ui);
+                ui::auth::render(self, ui);
             });
             return;
         }
 
         if compact_layout {
-            egui::TopBottomPanel::top("compact_controls").show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Chat");
-                    let selected_name = self
-                        .selected_session
-                        .and_then(|idx| self.sessions.get(idx))
-                        .map_or("New Chat", |s| s.name.as_str());
-
-                    egui::ComboBox::from_id_salt("session_selector")
-                        .selected_text(selected_name)
-                        .show_ui(ui, |ui| {
-                            let mut pending_selection: Option<usize> = None;
-                            for (idx, session) in self.sessions.iter().enumerate() {
-                                if ui
-                                    .selectable_label(self.selected_session == Some(idx), &session.name)
-                                    .clicked()
-                                {
-                                    pending_selection = Some(idx);
-                                }
-                            }
-
-                            if let Some(idx) = pending_selection {
-                                self.selected_session = Some(idx);
-                                self.creating_new_chat = false;
-                                self.load_selected_session_messages();
-                            }
-                        });
-
-                    if ui.button("+ New").clicked() {
-                        self.selected_session = None;
-                        self.creating_new_chat = true;
-                    }
-                });
-            });
+            ui::sidebar::render_compact_controls(self, ctx);
         } else {
             egui::SidePanel::left("session_sidebar")
                 .resizable(true)
                 .default_width(220.0)
                 .show(ctx, |ui| {
-                    self.render_sessions(ui);
+                    ui::sidebar::render_sessions(self, ui);
                 });
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.render_chat_panel(ui);
+            ui::chat::render_chat_panel(self, ui);
         });
 
         self.render_account_menu(ctx);
@@ -1714,6 +1369,7 @@ impl eframe::App for AuvroApp {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    dotenvy::dotenv().ok();
     let _ = load_environment();
 
     let options = eframe::NativeOptions {
