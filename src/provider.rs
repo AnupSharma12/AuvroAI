@@ -11,6 +11,13 @@ pub trait Provider {
     fn name(&self) -> &str;
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String>;
+
+    fn generate_reply_with_system_prompt(
+        &self,
+        system_prompt: &str,
+        prompt: &str,
+        conversation: &[String],
+    ) -> Result<String, String>;
 }
 
 pub fn create_default_provider() -> Box<dyn Provider> {
@@ -58,6 +65,32 @@ impl Provider for FailoverProvider {
                 }),
         }
     }
+
+    fn generate_reply_with_system_prompt(
+        &self,
+        system_prompt: &str,
+        prompt: &str,
+        conversation: &[String],
+    ) -> Result<String, String> {
+        match self
+            .primary
+            .generate_reply_with_system_prompt(system_prompt, prompt, conversation)
+        {
+            Ok(reply) => Ok(reply),
+            Err(primary_err) => self
+                .fallback
+                .generate_reply_with_system_prompt(system_prompt, prompt, conversation)
+                .map_err(|fallback_err| {
+                    format!(
+                        "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}",
+                        self.primary.name(),
+                        primary_err,
+                        self.fallback.name(),
+                        fallback_err
+                    )
+                }),
+        }
+    }
 }
 
 pub struct MockProvider;
@@ -75,6 +108,26 @@ impl Provider for MockProvider {
             prompt,
             previous_messages
         ))
+    }
+
+    fn generate_reply_with_system_prompt(
+        &self,
+        _system_prompt: &str,
+        prompt: &str,
+        _conversation: &[String],
+    ) -> Result<String, String> {
+        let title = prompt
+            .split_whitespace()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_owned();
+        if title.is_empty() {
+            Ok("New Chat".to_owned())
+        } else {
+            Ok(title)
+        }
     }
 }
 
@@ -132,18 +185,36 @@ impl Provider for HackClubProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
-        let messages = build_chat_messages(
-            CORE_SYSTEM_PROMPT,
-            prompt,
-            conversation,
-            DEFAULT_CONTEXT_TOKEN_BUDGET,
-        );
+        let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
         let options = RequestOptions {
             endpoint: self.chat_endpoint(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
             extra_headers: Vec::new(),
             timeout: Duration::from_secs(45),
+            max_retries: DEFAULT_RETRY_COUNT,
+            max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
+        };
+        let cancellation_token = CancellationToken::new();
+
+        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+            .map_err(|err| format!("HackClub AI request failed: {err}"))
+    }
+
+    fn generate_reply_with_system_prompt(
+        &self,
+        system_prompt: &str,
+        prompt: &str,
+        conversation: &[String],
+    ) -> Result<String, String> {
+        let messages =
+            build_chat_messages(system_prompt, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
+        let options = RequestOptions {
+            endpoint: self.chat_endpoint(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            extra_headers: Vec::new(),
+            timeout: Duration::from_secs(30),
             max_retries: DEFAULT_RETRY_COUNT,
             max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
         };
@@ -221,12 +292,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
-        let messages = build_chat_messages(
-            CORE_SYSTEM_PROMPT,
-            prompt,
-            conversation,
-            DEFAULT_CONTEXT_TOKEN_BUDGET,
-        );
+        let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
         let mut extra_headers = Vec::new();
 
         if let Some(site_url) = &self.site_url {
@@ -242,6 +308,38 @@ impl Provider for OpenRouterProvider {
             model: self.model.clone(),
             extra_headers,
             timeout: Duration::from_secs(45),
+            max_retries: DEFAULT_RETRY_COUNT,
+            max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
+        };
+        let cancellation_token = CancellationToken::new();
+
+        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+            .map_err(|err| format!("OpenRouter request failed: {err}"))
+    }
+
+    fn generate_reply_with_system_prompt(
+        &self,
+        system_prompt: &str,
+        prompt: &str,
+        conversation: &[String],
+    ) -> Result<String, String> {
+        let messages =
+            build_chat_messages(system_prompt, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
+        let mut extra_headers = Vec::new();
+
+        if let Some(site_url) = &self.site_url {
+            extra_headers.push(("HTTP-Referer".to_owned(), site_url.clone()));
+        }
+        if let Some(app_name) = &self.app_name {
+            extra_headers.push(("X-Title".to_owned(), app_name.clone()));
+        }
+
+        let options = RequestOptions {
+            endpoint: self.chat_endpoint(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            extra_headers,
+            timeout: Duration::from_secs(30),
             max_retries: DEFAULT_RETRY_COUNT,
             max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
         };

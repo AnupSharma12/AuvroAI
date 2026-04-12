@@ -1,8 +1,7 @@
 use reqwest::blocking::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::thread::sleep;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -191,10 +190,9 @@ fn read_streaming_response(
             continue;
         }
 
-        let payload = strip_sse_prefix(&buffer);
-        if payload.is_empty() {
+        let Some(payload) = sse_data_payload(&buffer) else {
             continue;
-        }
+        };
 
         if payload == b"[DONE]" {
             break;
@@ -209,11 +207,21 @@ fn read_streaming_response(
     Ok(output)
 }
 
-fn strip_sse_prefix(line: &[u8]) -> &[u8] {
-    if let Some(payload) = line.strip_prefix(b"data:") {
+fn sse_data_payload(line: &[u8]) -> Option<&[u8]> {
+    if line.starts_with(b":") {
+        return None;
+    }
+
+    let payload = if let Some(payload) = line.strip_prefix(b"data:") {
         trim_ascii_start(payload)
     } else {
-        line
+        return None;
+    };
+
+    if payload.is_empty() {
+        None
+    } else {
+        Some(payload)
     }
 }
 
@@ -230,6 +238,14 @@ fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn extract_chunk_text(payload: &[u8]) -> Result<String, String> {
+    let Some(first) = payload.first() else {
+        return Ok(String::new());
+    };
+    if *first != b'{' && *first != b'[' {
+        // Some providers send plain-text keepalive/status lines in SSE.
+        return Ok(String::new());
+    }
+
     let json: Value = serde_json::from_slice(payload)
         .map_err(|err| format!("Could not parse streaming chunk: {err}"))?;
 
