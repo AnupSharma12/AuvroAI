@@ -1,3 +1,4 @@
+mod api;
 mod chat_pipeline;
 mod cache;
 mod env;
@@ -5,46 +6,53 @@ mod secrets;
 mod provider;
 mod ui;
 
+use api::conversations::{self, Conversation, Message};
 use eframe::egui;
 use cache::model_metadata::ModelMetadataCache;
 use provider::{create_default_provider, Provider};
 use secrets::SecretStore;
-use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
-const TITLE_SYSTEM_PROMPT_PREFIX: &str =
-    "Generate a short, descriptive chat title (max 5 words, no punctuation) based on this message:";
-
-#[derive(Clone, Debug, Deserialize)]
-struct SessionRecord {
-    id: String,
-    title: String,
-    created_at: Option<String>,
-    updated_at: Option<String>,
+#[derive(Clone, Debug)]
+enum SupabaseEvent {
+    ConversationsLoaded(Result<Vec<Conversation>, String>),
+    ConversationCreated(Result<Conversation, String>),
+    MessagesLoaded {
+        conversation_id: Uuid,
+        result: Result<Vec<Message>, String>,
+    },
+    ConversationDeleted {
+        conversation_id: Uuid,
+        result: Result<(), String>,
+    },
+    MessageAppended(Result<Message, String>),
+    ConversationBumped {
+        conversation_id: Uuid,
+        result: Result<(), String>,
+    },
+    ConversationRetitled {
+        conversation_id: Uuid,
+        title: String,
+    },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct MessageRecord {
-    pub(crate) id: Option<String>,
-    pub(crate) session_id: Option<String>,
-    pub(crate) role: String,
-    pub(crate) content: String,
-    pub(crate) created_at: Option<String>,
-}
-
-pub(crate) struct ChatSession {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) messages: Vec<MessageRecord>,
+#[derive(Clone, Debug)]
+struct PendingTitleGeneration {
+    conversation_id: Uuid,
+    first_user_message: String,
 }
 
 pub(crate) struct AuvroApp {
     pub(crate) provider: Box<dyn Provider>,
     pub(crate) draft_message: String,
-    pub(crate) sessions: Vec<ChatSession>,
-    pub(crate) selected_session: Option<usize>,
+    pub(crate) conversations: Vec<Conversation>,
+    pub(crate) active_conversation_id: Option<Uuid>,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) messages_loading: bool,
+    pub(crate) pending_delete_conversation_id: Option<Uuid>,
     pub(crate) creating_new_chat: bool,
-    pub(crate) renaming_session: bool,
     pub(crate) auth_mode: AuthMode,
     pub(crate) auth_full_name: String,
     pub(crate) auth_email: String,
@@ -69,9 +77,13 @@ pub(crate) struct AuvroApp {
     pub(crate) error_message: Option<String>,
     pub(crate) pending_response: Option<Vec<char>>,
     pub(crate) streamed_chars: usize,
-    pub(crate) stream_session_index: Option<usize>,
+    pub(crate) stream_conversation_id: Option<Uuid>,
     pub(crate) stream_line_index: Option<usize>,
     pub(crate) last_stream_tick: Instant,
+    pending_title_generation: Option<PendingTitleGeneration>,
+    supabase_runtime: Arc<tokio::runtime::Runtime>,
+    supabase_events_tx: mpsc::Sender<SupabaseEvent>,
+    supabase_events_rx: mpsc::Receiver<SupabaseEvent>,
 }
 
 pub(crate) type AppState = AuvroApp;
@@ -84,6 +96,14 @@ pub(crate) enum AuthMode {
 
 impl Default for AuvroApp {
     fn default() -> Self {
+        let supabase_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to initialize Supabase task runtime"),
+        );
+        let (supabase_events_tx, supabase_events_rx) = mpsc::channel();
+
         let mut missing = Vec::new();
         if crate::env::SUPABASE_URL.trim().is_empty() {
             missing.push("SUPABASE_URL");
@@ -101,69 +121,38 @@ impl Default for AuvroApp {
             ))
         };
 
-        let (is_authenticated, user_id, user_email, user_full_name, auth_notice) =
-            if auth_error.is_none()
-                && !crate::env::SUPABASE_URL.is_empty()
-                && !crate::env::SUPABASE_PUBLISHABLE_KEY.is_empty()
-            {
-                Self::restore_auth_session(
-                    crate::env::SUPABASE_URL,
-                    crate::env::SUPABASE_PUBLISHABLE_KEY,
-                )
-            } else {
-                (false, None, None, None, None)
-            };
+        let (is_authenticated, user_id, user_email, user_full_name, auth_notice) = if auth_error
+            .is_none()
+            && !crate::env::SUPABASE_URL.is_empty()
+            && !crate::env::SUPABASE_PUBLISHABLE_KEY.is_empty()
+        {
+            Self::restore_auth_session(
+                crate::env::SUPABASE_URL,
+                crate::env::SUPABASE_PUBLISHABLE_KEY,
+            )
+        } else {
+            (false, None, None, None, None)
+        };
 
-        let mut sessions = Vec::new();
-        let mut selected_session = None;
-        let mut session_access_token = None;
-        if is_authenticated {
-            if let Ok(access_token) = SecretStore::new("AuvroAI").get("SUPABASE_ACCESS_TOKEN") {
-                session_access_token = Some(access_token.clone());
-                if let Some(uid) = user_id.as_deref() {
-                    if let Ok(rows) = Self::fetch_sessions(
-                        crate::env::SUPABASE_URL,
-                        crate::env::SUPABASE_PUBLISHABLE_KEY,
-                        &access_token,
-                        uid,
-                    ) {
-                        sessions = rows
-                            .into_iter()
-                            .map(|row| ChatSession {
-                                id: row.id,
-                                name: row.title,
-                                messages: Vec::new(),
-                            })
-                            .collect();
-
-                        if !sessions.is_empty() {
-                            selected_session = Some(0);
-                            let first_session_id = sessions[0].id.clone();
-                            if let Ok(messages) = Self::fetch_messages(
-                                crate::env::SUPABASE_URL,
-                                crate::env::SUPABASE_PUBLISHABLE_KEY,
-                                &access_token,
-                                &first_session_id,
-                            ) {
-                                sessions[0].messages = messages;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let session_access_token = if is_authenticated {
+            SecretStore::new("AuvroAI").get("SUPABASE_ACCESS_TOKEN").ok()
+        } else {
+            None
+        };
 
         let settings_name_draft = user_full_name.clone().unwrap_or_default();
         let settings_email_draft = user_email.clone().unwrap_or_default();
         let selected_model_id = crate::env::OPENROUTER_MODEL.to_owned();
 
-        Self {
+        let mut app = Self {
             provider: create_default_provider(),
             draft_message: String::new(),
-            sessions,
-            selected_session,
+            conversations: Vec::new(),
+            active_conversation_id: None,
+            messages: Vec::new(),
+            messages_loading: false,
+            pending_delete_conversation_id: None,
             creating_new_chat: false,
-            renaming_session: false,
             auth_mode: AuthMode::Login,
             auth_full_name: String::new(),
             auth_email: String::new(),
@@ -188,10 +177,20 @@ impl Default for AuvroApp {
             error_message: None,
             pending_response: None,
             streamed_chars: 0,
-            stream_session_index: None,
+            stream_conversation_id: None,
             stream_line_index: None,
             last_stream_tick: Instant::now(),
+            pending_title_generation: None,
+            supabase_runtime,
+            supabase_events_tx,
+            supabase_events_rx,
+        };
+
+        if app.is_authenticated {
+            app.request_list_conversations();
         }
+
+        app
     }
 }
 
@@ -231,7 +230,10 @@ impl AuvroApp {
         key: &str,
         access_token: &str,
     ) -> Result<(String, String, Option<String>), String> {
-        let endpoint = format!("{}/auth/v1/user", url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/auth/v1/user",
+            crate::env::normalized_supabase_url(url)
+        );
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(8))
             .build()
@@ -284,182 +286,285 @@ impl AuvroApp {
             .map_err(|_| "Missing auth session token. Please log in again.".to_owned())
     }
 
-    fn fetch_sessions(
-        url: &str,
-        key: &str,
-        access_token: &str,
-        user_id: &str,
-    ) -> Result<Vec<SessionRecord>, String> {
-        let endpoint = format!(
-            "{}/rest/v1/sessions?select=id,title,created_at,updated_at&user_id=eq.{}&order=updated_at.desc",
-            url.trim_end_matches('/'),
-            user_id
-        );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|e| e.to_string())?;
+    fn request_list_conversations(&mut self) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
 
-        let response = client
-            .get(endpoint)
-            .header("apikey", key)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Accept", "application/json")
-            .send()
-            .map_err(|e| e.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Fetch sessions failed ({status}): {text}"));
-        }
-
-        response.json().map_err(|e| e.to_string())
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || conversations::list_conversations(&token))
+                .await
+                .map_err(|err| format!("Failed to run conversation-list task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ConversationsLoaded(result));
+        });
     }
 
-    fn fetch_messages(
-        url: &str,
-        key: &str,
-        access_token: &str,
-        session_id: &str,
-    ) -> Result<Vec<MessageRecord>, String> {
-        let endpoint = format!(
-            "{}/rest/v1/messages?select=id,session_id,role,content,created_at&session_id=eq.{}&order=created_at.asc",
-            url.trim_end_matches('/'),
-            session_id
-        );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|e| e.to_string())?;
+    pub(crate) fn request_create_conversation(&mut self, title: &str) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.error_message = Some(err);
+                self.creating_new_chat = false;
+                self.messages_loading = false;
+                return;
+            }
+        };
 
-        let response = client
-            .get(endpoint)
-            .header("apikey", key)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Accept", "application/json")
-            .send()
-            .map_err(|e| e.to_string())?;
+        let user_id = match self.user_id.as_deref() {
+            Some(user_id) if !user_id.trim().is_empty() => user_id.to_owned(),
+            _ => {
+                self.error_message = Some("Missing user id. Please log in again.".to_owned());
+                self.creating_new_chat = false;
+                self.messages_loading = false;
+                return;
+            }
+        };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Fetch messages failed ({status}): {text}"));
-        }
-
-        response.json().map_err(|e| e.to_string())
+        let title = title.to_owned();
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                conversations::create_conversation(&token, &title, &user_id)
+            })
+                .await
+                .map_err(|err| format!("Failed to run conversation-create task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ConversationCreated(result));
+        });
     }
 
-    fn insert_session(
-        url: &str,
-        key: &str,
-        access_token: &str,
-        user_id: &str,
-        title: &str,
-    ) -> Result<SessionRecord, String> {
-        let endpoint = format!(
-            "{}/rest/v1/sessions",
-            url.trim_end_matches('/')
-        );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|e| e.to_string())?;
+    pub(crate) fn request_load_messages(&mut self, conversation_id: Uuid) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.error_message = Some(err);
+                self.messages_loading = false;
+                return;
+            }
+        };
 
-        let response = client
-            .post(endpoint)
-            .header("apikey", key)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .header("Prefer", "return=representation")
-            .json(&serde_json::json!({ "user_id": user_id, "title": title }))
-            .send()
-            .map_err(|e| e.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Create session failed ({status}): {text}"));
-        }
-
-        let rows: Vec<SessionRecord> = response.json().map_err(|e| e.to_string())?;
-        rows.into_iter()
-            .next()
-            .ok_or_else(|| "Supabase did not return created session".to_owned())
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || conversations::list_messages(&token, conversation_id))
+                .await
+                .map_err(|err| format!("Failed to run messages-list task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::MessagesLoaded {
+                conversation_id,
+                result,
+            });
+        });
     }
 
-    fn insert_message(
-        url: &str,
-        key: &str,
-        access_token: &str,
-        session_id: &str,
-        role: &str,
-        content: &str,
-    ) -> Result<(), String> {
-        let endpoint = format!(
-            "{}/rest/v1/messages",
-            url.trim_end_matches('/')
-        );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|e| e.to_string())?;
+    pub(crate) fn request_delete_conversation(&mut self, conversation_id: Uuid) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
 
-        let response = client
-            .post(endpoint)
-            .header("apikey", key)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "session_id": session_id,
-                "role": role,
-                "content": content
-            }))
-            .send()
-            .map_err(|e| e.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Insert message failed ({status}): {text}"));
-        }
-
-        Ok(())
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || conversations::delete_conversation(&token, conversation_id))
+                .await
+                .map_err(|err| format!("Failed to run conversation-delete task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ConversationDeleted {
+                conversation_id,
+                result,
+            });
+        });
     }
 
-    fn touch_session(
-        url: &str,
-        key: &str,
-        access_token: &str,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let endpoint = format!(
-            "{}/rest/v1/sessions?id=eq.{}",
-            url.trim_end_matches('/'),
-            session_id
-        );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|e| e.to_string())?;
+    fn request_append_message(&self, conversation_id: Uuid, role: &str, content: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(_) => return,
+        };
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let response = client
-            .patch(endpoint)
-            .header("apikey", key)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "updated_at": now }))
-            .send()
-            .map_err(|e| e.to_string())?;
+        let role = role.to_owned();
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                conversations::append_message(&token, conversation_id, &role, &content)
+            })
+            .await
+            .map_err(|err| format!("Failed to run append-message task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::MessageAppended(result));
+        });
+    }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Update session timestamp failed ({status}): {text}"));
+    fn request_bump_conversation_updated_at(&self, conversation_id: Uuid) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(_) => return,
+        };
+
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                conversations::bump_conversation_updated_at(&token, conversation_id)
+            })
+            .await
+            .map_err(|err| format!("Failed to run bump-conversation task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ConversationBumped {
+                conversation_id,
+                result,
+            });
+        });
+    }
+
+    fn request_generate_conversation_title(&self, conversation_id: Uuid, first_user_message: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(_) => return,
+        };
+
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let title = crate::api::ai::generate_title(&first_user_message)?;
+                conversations::rename_conversation(&token, conversation_id, &title)?;
+                Ok::<(Uuid, String), String>((conversation_id, title))
+            })
+            .await
+            .map_err(|err| format!("Failed to run title-generation task: {err}"))
+            .and_then(|result| result);
+
+            if let Ok((conversation_id, title)) = result {
+                let _ = tx.send(SupabaseEvent::ConversationRetitled {
+                    conversation_id,
+                    title,
+                });
+            }
+        });
+    }
+
+    fn sort_conversations_desc(&mut self) {
+        self.conversations
+            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    }
+
+    fn process_supabase_events(&mut self) {
+        while let Ok(event) = self.supabase_events_rx.try_recv() {
+            match event {
+                SupabaseEvent::ConversationsLoaded(result) => match result {
+                    Ok(conversations) => {
+                        self.conversations = conversations;
+                        self.sort_conversations_desc();
+                    }
+                    Err(err) => self.error_message = Some(err),
+                },
+                SupabaseEvent::ConversationCreated(result) => match result {
+                    Ok(conversation) => {
+                        self.conversations.retain(|item| item.id != conversation.id);
+                        self.conversations.insert(0, conversation.clone());
+                        self.active_conversation_id = Some(conversation.id);
+                        self.messages.clear();
+                        self.messages_loading = false;
+                        self.creating_new_chat = false;
+                    }
+                    Err(err) => {
+                        self.creating_new_chat = false;
+                        self.messages_loading = false;
+                        self.error_message = Some(err);
+                    }
+                },
+                SupabaseEvent::MessagesLoaded {
+                    conversation_id,
+                    result,
+                } => {
+                    if self.active_conversation_id != Some(conversation_id) {
+                        continue;
+                    }
+
+                    self.messages_loading = false;
+                    match result {
+                        Ok(messages) => self.messages = messages,
+                        Err(err) => self.error_message = Some(err),
+                    }
+                }
+                SupabaseEvent::ConversationDeleted {
+                    conversation_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        self.conversations.retain(|item| item.id != conversation_id);
+                        if self.active_conversation_id == Some(conversation_id) {
+                            self.active_conversation_id = None;
+                            self.messages.clear();
+                            self.messages_loading = false;
+                        }
+                    }
+                    Err(err) => self.error_message = Some(err),
+                },
+                SupabaseEvent::MessageAppended(result) => {
+                    match result {
+                        Ok(message) => {
+                            if message.role == "assistant" {
+                                if let Some(pending) = self.pending_title_generation.take() {
+                                    if pending.conversation_id == message.conversation_id {
+                                        self.request_generate_conversation_title(
+                                            pending.conversation_id,
+                                            pending.first_user_message,
+                                        );
+                                    } else {
+                                        self.pending_title_generation = Some(pending);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.pending_title_generation = None;
+                            self.error_message = Some(err);
+                        }
+                    }
+                }
+                SupabaseEvent::ConversationBumped {
+                    conversation_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        if let Some(conversation) =
+                            self.conversations.iter_mut().find(|item| item.id == conversation_id)
+                        {
+                            conversation.updated_at = chrono::Utc::now();
+                        }
+                        self.sort_conversations_desc();
+                    }
+                    Err(err) => self.error_message = Some(err),
+                },
+                SupabaseEvent::ConversationRetitled {
+                    conversation_id,
+                    title,
+                } => {
+                    if let Some(conversation) =
+                        self.conversations.iter_mut().find(|item| item.id == conversation_id)
+                    {
+                        conversation.title = title;
+                        conversation.updated_at = chrono::Utc::now();
+                        self.sort_conversations_desc();
+                    }
+                }
+            }
         }
-
-        Ok(())
     }
 
     fn update_supabase_user(
@@ -467,7 +572,7 @@ impl AuvroApp {
         access_token: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let endpoint = format!("{}/auth/v1/user", crate::env::SUPABASE_URL.trim_end_matches('/'));
+        let endpoint = format!("{}/user", crate::env::supabase_auth_url());
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -498,10 +603,7 @@ impl AuvroApp {
             .ok_or_else(|| "Missing user id. Please log in again.".to_owned())?;
         let access_token = self.access_token()?;
 
-        let endpoint = format!(
-            "{}/rest/v1/user_settings",
-            crate::env::SUPABASE_URL.trim_end_matches('/')
-        );
+        let endpoint = format!("{}/user_settings", crate::env::supabase_rest_url());
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -679,33 +781,10 @@ impl AuvroApp {
             return;
         }
 
-        let endpoint = format!(
-            "{}/auth/v1/token?grant_type=password",
-            crate::env::SUPABASE_URL.trim_end_matches('/')
-        );
-
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-        {
-            Ok(client) => client,
-            Err(err) => {
-                self.auth_notice = Some(format!("Login setup failed: {err}"));
-                return;
-            }
-        };
-
-        let response = client
-            .post(endpoint)
-            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "email": email, "password": password }))
-            .send();
-
-        let response = match response {
+        let response = match crate::api::supabase::signin_with_password(&email, &password) {
             Ok(resp) => resp,
             Err(err) => {
-                self.auth_notice = Some(format!("Login request failed: {err}"));
+                self.auth_notice = Some(err);
                 return;
             }
         };
@@ -769,28 +848,12 @@ impl AuvroApp {
         self.user_full_name = user_full_name;
         self.settings_email_draft = user_email.clone();
         self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
-        self.sessions.clear();
-        self.selected_session = None;
-        if let Some(uid) = user_id {
-            if let Ok(rows) = Self::fetch_sessions(
-                crate::env::SUPABASE_URL,
-                crate::env::SUPABASE_PUBLISHABLE_KEY,
-                &access_token,
-                &uid,
-            ) {
-                self.sessions = rows
-                    .into_iter()
-                    .map(|row| ChatSession {
-                        id: row.id,
-                        name: row.title,
-                        messages: Vec::new(),
-                    })
-                    .collect();
-                if !self.sessions.is_empty() {
-                    self.selected_session = Some(0);
-                    self.load_selected_session_messages();
-                }
-            }
+        self.conversations.clear();
+        self.active_conversation_id = None;
+        self.messages.clear();
+        self.messages_loading = false;
+        if user_id.is_some() {
+            self.request_list_conversations();
         }
         self.auth_password.clear();
         self.auth_notice = Some(format!("Logged in as {user_email}"));
@@ -812,10 +875,7 @@ impl AuvroApp {
             return;
         }
 
-        let endpoint = format!(
-            "{}/auth/v1/signup",
-            crate::env::SUPABASE_URL.trim_end_matches('/')
-        );
+        let endpoint = format!("{}/signup", crate::env::supabase_auth_url());
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(12))
             .build()
@@ -893,11 +953,14 @@ impl AuvroApp {
             self.user_full_name = user_full_name;
             self.settings_email_draft = user_email.clone();
             self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
-            self.sessions.clear();
-            self.selected_session = None;
+            self.conversations.clear();
+            self.active_conversation_id = None;
+            self.messages.clear();
+            self.messages_loading = false;
             self.creating_new_chat = true;
             self.auth_password.clear();
             self.auth_confirm_password.clear();
+            self.request_list_conversations();
             self.auth_notice = Some(format!("Signup successful. Logged in as {user_email}"));
         } else {
             self.auth_notice = Some(
@@ -914,8 +977,12 @@ impl AuvroApp {
         self.user_id = None;
         self.user_email = None;
         self.user_full_name = None;
-        self.sessions.clear();
-        self.selected_session = None;
+        self.conversations.clear();
+        self.active_conversation_id = None;
+        self.messages.clear();
+        self.messages_loading = false;
+        self.pending_title_generation = None;
+        self.pending_delete_conversation_id = None;
         self.creating_new_chat = false;
         self.profile_menu_open = false;
         self.settings_open = false;
@@ -929,7 +996,7 @@ impl AuvroApp {
         self.auth_notice = Some("Logged out.".to_owned());
     }
 
-    fn as_conversation_lines(messages: &[MessageRecord]) -> Vec<String> {
+    fn as_conversation_lines(messages: &[Message]) -> Vec<String> {
         messages
             .iter()
             .map(|m| {
@@ -942,45 +1009,6 @@ impl AuvroApp {
             .collect()
     }
 
-    fn normalize_title(title: &str) -> String {
-        let cleaned: String = title
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
-                    ch
-                } else {
-                    ' '
-                }
-            })
-            .collect();
-        let words = cleaned
-            .split_whitespace()
-            .take(5)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let joined = words.join(" ").trim().to_owned();
-        if joined.is_empty() {
-            "New Chat".to_owned()
-        } else {
-            joined
-        }
-    }
-
-    fn is_missing_table_error(error: &str) -> bool {
-        let lower = error.to_ascii_lowercase();
-        lower.contains("pgrst205")
-            || lower.contains("could not find the table")
-            || lower.contains("schema cache")
-    }
-
-    fn local_session_id() -> String {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        format!("local-{millis}")
-    }
-
     pub(crate) fn sidebar_title(title: &str) -> String {
         const MAX_CHARS: usize = 28;
         if title.chars().count() <= MAX_CHARS {
@@ -990,129 +1018,24 @@ impl AuvroApp {
         format!("{trimmed}...")
     }
 
-    pub(crate) fn load_selected_session_messages(&mut self) {
-        let Some(idx) = self.selected_session else {
-            return;
-        };
-        let Some(session_id) = self.sessions.get(idx).map(|s| s.id.clone()) else {
-            return;
-        };
-
-        if session_id.starts_with("local-") {
-            return;
-        }
-
-        let access_token = match self.access_token() {
-            Ok(token) => token,
-            Err(err) => {
-                self.error_message = Some(err);
-                return;
-            }
-        };
-
-        match Self::fetch_messages(
-            crate::env::SUPABASE_URL,
-            crate::env::SUPABASE_PUBLISHABLE_KEY,
-            &access_token,
-            &session_id,
-        ) {
-            Ok(messages) => {
-                if let Some(session) = self.sessions.get_mut(idx) {
-                    session.messages = messages;
-                }
-            }
-            Err(err) => self.error_message = Some(err),
-        }
+    pub(crate) fn start_new_chat(&mut self) {
+        self.error_message = None;
+        self.creating_new_chat = true;
+        self.active_conversation_id = None;
+        self.messages.clear();
+        self.messages_loading = false;
+        self.pending_title_generation = None;
+        self.pending_delete_conversation_id = None;
+        self.request_create_conversation("New Chat");
     }
 
-    fn create_session_for_first_message(&mut self, first_message: &str) -> Result<usize, String> {
-        let uid = self
-            .user_id
-            .clone()
-            .ok_or_else(|| "Missing user id. Please log in again.".to_owned())?;
-        let access_token = self.access_token()?;
-
-        let system_prompt = format!("{} `{}`", TITLE_SYSTEM_PROMPT_PREFIX, first_message);
-        let raw_title = self
-            .provider
-            .generate_reply_with_system_prompt(&system_prompt, first_message, &[])
-            .unwrap_or_else(|_| "New Chat".to_owned());
-        let title = Self::normalize_title(&raw_title);
-
-        match Self::insert_session(
-            crate::env::SUPABASE_URL,
-            crate::env::SUPABASE_PUBLISHABLE_KEY,
-            &access_token,
-            &uid,
-            &title,
-        ) {
-            Ok(row) => {
-                self.sessions.insert(
-                    0,
-                    ChatSession {
-                        id: row.id,
-                        name: row.title,
-                        messages: Vec::new(),
-                    },
-                );
-                self.selected_session = Some(0);
-                self.creating_new_chat = false;
-                Ok(0)
-            }
-            Err(err) => {
-                if Self::is_missing_table_error(&err) {
-                    self.sessions.insert(
-                        0,
-                        ChatSession {
-                            id: Self::local_session_id(),
-                            name: title,
-                            messages: Vec::new(),
-                        },
-                    );
-                    self.selected_session = Some(0);
-                    self.creating_new_chat = false;
-                    self.auth_notice = Some(
-                        "Supabase sessions/messages tables are missing. Running in local-only chat mode."
-                            .to_owned(),
-                    );
-                    Ok(0)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    fn push_message_to_db(&self, session_id: &str, role: &str, content: &str) -> Result<(), String> {
-        if session_id.starts_with("local-") {
-            return Ok(());
-        }
-
-        let access_token = self.access_token()?;
-        Self::insert_message(
-            crate::env::SUPABASE_URL,
-            crate::env::SUPABASE_PUBLISHABLE_KEY,
-            &access_token,
-            session_id,
-            role,
-            content,
-        )?;
-        Self::touch_session(
-            crate::env::SUPABASE_URL,
-            crate::env::SUPABASE_PUBLISHABLE_KEY,
-            &access_token,
-            session_id,
-        )
-    }
-
-    fn reorder_session_to_top(&mut self, index: usize) {
-        if index == 0 || index >= self.sessions.len() {
-            self.selected_session = Some(index.min(self.sessions.len().saturating_sub(1)));
-            return;
-        }
-        let moved = self.sessions.remove(index);
-        self.sessions.insert(0, moved);
-        self.selected_session = Some(0);
+    pub(crate) fn select_conversation(&mut self, conversation_id: Uuid) {
+        self.active_conversation_id = Some(conversation_id);
+        self.creating_new_chat = false;
+        self.messages.clear();
+        self.messages_loading = true;
+        self.pending_title_generation = None;
+        self.request_load_messages(conversation_id);
     }
 
     pub(crate) fn send_message(&mut self) {
@@ -1128,39 +1051,35 @@ impl AuvroApp {
         self.draft_message.clear();
         self.error_message = None;
 
-        let session_index = match self.selected_session {
-            Some(idx) => idx,
-            None => match self.create_session_for_first_message(&prompt) {
-                Ok(idx) => idx,
-                Err(err) => {
-                    self.error_message = Some(err);
-                    return;
-                }
-            },
+        let Some(conversation_id) = self.active_conversation_id else {
+            self.error_message = Some("Create or select a conversation first.".to_owned());
+            return;
         };
 
-        let session_id = self.sessions[session_index].id.clone();
-        if let Err(err) = self.push_message_to_db(&session_id, "user", &prompt) {
-            if Self::is_missing_table_error(&err) {
-                self.auth_notice = Some(
-                    "Supabase sessions/messages tables are missing. Messages are stored locally only."
-                        .to_owned(),
-                );
-            } else {
-                self.error_message = Some(err);
-                return;
-            }
-        }
-
-        self.sessions[session_index].messages.push(MessageRecord {
-            id: None,
-            session_id: Some(session_id.clone()),
+        self.messages.push(Message {
+            id: Uuid::new_v4(),
+            conversation_id,
             role: "user".to_owned(),
             content: prompt.clone(),
-            created_at: None,
+            created_at: chrono::Utc::now(),
         });
+        let should_generate_title = self.messages.len() == 1
+            && self
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .map(|conversation| conversation.title.trim() == "New Chat")
+                .unwrap_or(false);
+        if should_generate_title {
+            self.pending_title_generation = Some(PendingTitleGeneration {
+                conversation_id,
+                first_user_message: prompt.clone(),
+            });
+        }
+        self.request_append_message(conversation_id, "user", prompt.clone());
+        self.request_bump_conversation_updated_at(conversation_id);
 
-        let conversation = Self::as_conversation_lines(&self.sessions[session_index].messages);
+        let conversation = Self::as_conversation_lines(&self.messages);
         let full_response = match self.provider.generate_reply(&prompt, &conversation) {
             Ok(reply) => reply,
             Err(err) => {
@@ -1169,18 +1088,18 @@ impl AuvroApp {
             }
         };
 
-        self.sessions[session_index].messages.push(MessageRecord {
-            id: None,
-            session_id: Some(session_id),
+        self.messages.push(Message {
+            id: Uuid::new_v4(),
+            conversation_id,
             role: "assistant".to_owned(),
             content: String::new(),
-            created_at: None,
+            created_at: chrono::Utc::now(),
         });
 
         self.pending_response = Some(full_response.chars().collect());
         self.streamed_chars = 0;
-        self.stream_session_index = Some(session_index);
-        self.stream_line_index = Some(self.sessions[session_index].messages.len() - 1);
+        self.stream_conversation_id = Some(conversation_id);
+        self.stream_line_index = Some(self.messages.len().saturating_sub(1));
         self.is_loading = true;
         self.last_stream_tick = Instant::now();
     }
@@ -1206,12 +1125,9 @@ impl AuvroApp {
         self.streamed_chars = (self.streamed_chars + 3).min(chars_len);
         let streamed_text: String = chars.iter().take(self.streamed_chars).collect();
 
-        if let (Some(session_idx), Some(line_idx)) = (self.stream_session_index, self.stream_line_index)
-        {
-            if let Some(session) = self.sessions.get_mut(session_idx) {
-                if let Some(message) = session.messages.get_mut(line_idx) {
-                    message.content = streamed_text;
-                }
+        if let Some(line_idx) = self.stream_line_index {
+            if let Some(message) = self.messages.get_mut(line_idx) {
+                message.content = streamed_text;
             }
         }
 
@@ -1219,15 +1135,17 @@ impl AuvroApp {
             self.is_loading = false;
             self.pending_response = None;
 
-            if let (Some(session_idx), Some(line_idx)) =
-                (self.stream_session_index.take(), self.stream_line_index.take())
+            if let (Some(conversation_id), Some(line_idx)) =
+                (self.stream_conversation_id.take(), self.stream_line_index.take())
             {
-                if let Some(session) = self.sessions.get(session_idx) {
-                    if let Some(message) = session.messages.get(line_idx) {
-                        let _ = self.push_message_to_db(&session.id, "assistant", &message.content);
-                    }
+                if let Some(message) = self.messages.get(line_idx) {
+                    self.request_append_message(
+                        conversation_id,
+                        "assistant",
+                        message.content.clone(),
+                    );
+                    self.request_bump_conversation_updated_at(conversation_id);
                 }
-                self.reorder_session_to_top(session_idx);
             }
         }
     }
@@ -1236,6 +1154,7 @@ impl AuvroApp {
 
 impl eframe::App for AuvroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_supabase_events();
         self.tick_streaming(ctx);
 
         ctx.set_visuals(egui::Visuals {
@@ -1362,6 +1281,8 @@ impl eframe::App for AuvroApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui::chat::render_chat_panel(self, ui);
         });
+
+        ui::sidebar::render_delete_confirmation(self, ctx);
 
         self.render_account_menu(ctx);
         self.render_settings_window(ctx);

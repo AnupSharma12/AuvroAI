@@ -5,8 +5,8 @@ use std::io::{BufRead, BufReader};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4096;
-const DEFAULT_RETRY_COUNT: u32 = 3;
+const _DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4096;
+const _DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_BACKOFF_BASE_MS: u64 = 250;
 
 #[derive(Clone, Debug, Serialize)]
@@ -23,6 +23,7 @@ pub struct RequestOptions {
     pub extra_headers: Vec<(String, String)>,
     pub timeout: Duration,
     pub max_retries: u32,
+    #[allow(dead_code)]
     pub max_context_tokens: usize,
 }
 

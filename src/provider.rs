@@ -12,6 +12,7 @@ pub trait Provider {
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String>;
 
+    #[allow(dead_code)]
     fn generate_reply_with_system_prompt(
         &self,
         system_prompt: &str,

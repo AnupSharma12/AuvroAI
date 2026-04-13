@@ -2,11 +2,21 @@ use eframe::egui;
 
 pub(crate) fn render_sessions(app: &mut crate::AppState, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        if ui.button("+ New Chat").clicked() {
-            app.selected_session = None;
-            app.creating_new_chat = true;
-            app.error_message = None;
-            app.renaming_session = false;
+        if ui
+            .add_enabled(!app.is_loading, egui::Button::new("+ New Chat"))
+            .clicked()
+        {
+            app.start_new_chat();
+        }
+
+        if ui
+            .add_enabled(
+                app.active_conversation_id.is_some() && app.pending_delete_conversation_id.is_none(),
+                egui::Button::new("Delete"),
+            )
+            .clicked()
+        {
+            app.pending_delete_conversation_id = app.active_conversation_id;
         }
     });
 
@@ -14,9 +24,18 @@ pub(crate) fn render_sessions(app: &mut crate::AppState, ui: &mut egui::Ui) {
     ui.heading("Chats");
     ui.add_space(8.0);
 
-    for idx in 0..app.sessions.len() {
-        let selected = app.selected_session == Some(idx);
-        let label = crate::AuvroApp::sidebar_title(&app.sessions[idx].name);
+    if app.conversations.is_empty() {
+        if app.creating_new_chat {
+            ui.label("Creating chat...");
+        } else {
+            ui.label("No chats yet. Start a new one.");
+        }
+        return;
+    }
+
+    for conversation in app.conversations.clone() {
+        let selected = app.active_conversation_id == Some(conversation.id);
+        let label = crate::AuvroApp::sidebar_title(&conversation.title);
 
         if ui
             .add_sized(
@@ -25,9 +44,7 @@ pub(crate) fn render_sessions(app: &mut crate::AppState, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            app.selected_session = Some(idx);
-            app.creating_new_chat = false;
-            app.load_selected_session_messages();
+            app.select_conversation(conversation.id);
         }
         ui.add_space(4.0);
     }
@@ -38,34 +55,83 @@ pub(crate) fn render_compact_controls(app: &mut crate::AppState, ctx: &egui::Con
         ui.horizontal_wrapped(|ui| {
             ui.label("Chat");
             let selected_name = app
-                .selected_session
-                .and_then(|idx| app.sessions.get(idx))
-                .map_or("New Chat", |s| s.name.as_str());
+                .active_conversation_id
+                .and_then(|id| app.conversations.iter().find(|conversation| conversation.id == id))
+                .map_or("Select Chat", |conversation| conversation.title.as_str());
 
-            egui::ComboBox::from_id_salt("session_selector")
+            egui::ComboBox::from_id_salt("conversation_selector")
                 .selected_text(selected_name)
                 .show_ui(ui, |ui| {
-                    let mut pending_selection: Option<usize> = None;
-                    for (idx, session) in app.sessions.iter().enumerate() {
+                    let mut pending_selection = None;
+                    for conversation in app.conversations.iter() {
                         if ui
-                            .selectable_label(app.selected_session == Some(idx), &session.name)
+                            .selectable_label(
+                                app.active_conversation_id == Some(conversation.id),
+                                &conversation.title,
+                            )
                             .clicked()
                         {
-                            pending_selection = Some(idx);
+                            pending_selection = Some(conversation.id);
                         }
                     }
 
-                    if let Some(idx) = pending_selection {
-                        app.selected_session = Some(idx);
-                        app.creating_new_chat = false;
-                        app.load_selected_session_messages();
+                    if let Some(conversation_id) = pending_selection {
+                        app.select_conversation(conversation_id);
                     }
                 });
 
-            if ui.button("+ New").clicked() {
-                app.selected_session = None;
-                app.creating_new_chat = true;
+            if ui
+                .add_enabled(!app.is_loading, egui::Button::new("+ New"))
+                .clicked()
+            {
+                app.start_new_chat();
+            }
+
+            if ui
+                .add_enabled(
+                    app.active_conversation_id.is_some() && app.pending_delete_conversation_id.is_none(),
+                    egui::Button::new("Delete"),
+                )
+                .clicked()
+            {
+                app.pending_delete_conversation_id = app.active_conversation_id;
             }
         });
     });
+}
+
+pub(crate) fn render_delete_confirmation(app: &mut crate::AppState, ctx: &egui::Context) {
+    let Some(conversation_id) = app.pending_delete_conversation_id else {
+        return;
+    };
+
+    let title = app
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .map(|conversation| conversation.title.clone())
+        .unwrap_or_else(|| "this chat".to_owned());
+
+    egui::Window::new("Delete conversation")
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(format!("Delete \"{}\"? This cannot be undone.", title));
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    app.pending_delete_conversation_id = None;
+                }
+
+                if ui
+                    .add_enabled(!app.is_loading, egui::Button::new("Delete"))
+                    .clicked()
+                {
+                    app.request_delete_conversation(conversation_id);
+                    app.pending_delete_conversation_id = None;
+                }
+            });
+        });
 }

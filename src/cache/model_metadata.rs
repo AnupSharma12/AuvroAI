@@ -18,6 +18,7 @@ pub enum ModelProvider {
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
+    #[allow(dead_code)]
     pub provider: ModelProvider,
     pub context_length: u32,
     pub prompt_price_per_1k: f64,
@@ -114,6 +115,7 @@ impl ModelMetadataCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_failed(&self, message: String) {
         if let Ok(mut guard) = self.state.lock() {
             *guard = CacheState::Failed(message);

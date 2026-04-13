@@ -8,8 +8,7 @@ pub(crate) fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
         ui.add_space(16.0);
 
         if ui.button("New Chat").clicked() {
-            app.creating_new_chat = true;
-            app.selected_session = None;
+            app.start_new_chat();
         }
 
         ui.add_space(12.0);
@@ -20,8 +19,7 @@ pub(crate) fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
                 "Plan my learning roadmap",
             ] {
                 if ui.button(suggestion).clicked() {
-                    app.creating_new_chat = true;
-                    app.selected_session = None;
+                    app.start_new_chat();
                     app.draft_message = suggestion.to_owned();
                 }
             }
@@ -30,31 +28,61 @@ pub(crate) fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
-    if app.sessions.is_empty() && !app.creating_new_chat {
+    if app.active_conversation_id.is_none() && app.conversations.is_empty() && !app.creating_new_chat {
         render_empty_state(app, ui);
         return;
     }
 
-    let session_name = app
-        .selected_session
-        .and_then(|idx| app.sessions.get(idx))
-        .map(|s| s.name.as_str())
-        .unwrap_or("New Chat");
+    if app.active_conversation_id.is_none() && app.creating_new_chat {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.spinner();
+            ui.label("Creating chat...");
+        });
+        return;
+    }
 
-    ui.heading(format!("Chat - {session_name}"));
+    let Some(active_conversation_id) = app.active_conversation_id else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.heading("Select a chat");
+            ui.label("Choose a conversation from the sidebar or start a new chat.");
+        });
+        return;
+    };
+
+    let conversation_name = app
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == active_conversation_id)
+        .map(|conversation| conversation.title.as_str())
+        .unwrap_or("Chat");
+
+    ui.heading(format!("Chat - {conversation_name}"));
     ui.add_space(6.0);
     ui.separator();
     ui.add_space(8.0);
+
+    if app.messages_loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Loading messages...");
+        });
+        ui.add_space(8.0);
+    }
 
     egui::ScrollArea::vertical()
         .id_salt("chat_scroll")
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            if let Some(session) = app.selected_session.and_then(|idx| app.sessions.get(idx)) {
-                for message in &session.messages {
-                    let prefix = if message.role == "user" { "You" } else { "Auvro" };
-                    ui.label(format!("{prefix}: {}", message.content));
-                }
+            if app.messages.is_empty() && !app.messages_loading {
+                ui.label("No messages yet. Send your first message to get started.");
+                ui.add_space(8.0);
+            }
+
+            for message in &app.messages {
+                let prefix = if message.role == "user" { "You" } else { "Auvro" };
+                ui.label(format!("{prefix}: {}", message.content));
             }
         });
 
@@ -90,8 +118,10 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
     let send_clicked = ui
         .add_enabled(
             !app.is_loading
+                && !app.messages_loading
                 && app.auth_error.is_none()
-                && !crate::env::SUPABASE_PUBLISHABLE_KEY.trim().is_empty(),
+                && !crate::env::SUPABASE_PUBLISHABLE_KEY.trim().is_empty()
+                && app.active_conversation_id.is_some(),
             egui::Button::new("Send"),
         )
         .clicked();
