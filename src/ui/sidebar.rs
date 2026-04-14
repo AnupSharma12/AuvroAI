@@ -1,6 +1,6 @@
 use eframe::egui;
 
-pub(crate) fn render_sessions(app: &mut crate::AppState, ui: &mut egui::Ui) {
+pub(crate) fn render_sessions(app: &mut crate::AppState, ui: &mut egui::Ui, _ctx: &egui::Context) {
     ui.horizontal(|ui| {
         if ui
             .add_enabled(!app.is_loading, egui::Button::new("+ New Chat"))

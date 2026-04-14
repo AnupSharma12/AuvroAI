@@ -1,5 +1,43 @@
 use eframe::egui;
 
+fn render_chat_avatar_button(app: &mut crate::AppState, ui: &mut egui::Ui) {
+    let initials = app.profile_initials();
+    let response = app.render_profile_avatar(ui, &initials, 16.0, true);
+    if response.clicked() {
+        app.profile_menu_open = !app.profile_menu_open;
+        app.profile_menu_anchor = Some(response.rect.left_bottom() + egui::vec2(-120.0, 8.0));
+    }
+}
+
+fn render_avatar_menu(app: &mut crate::AppState, ctx: &egui::Context) {
+    if !app.profile_menu_open {
+        return;
+    }
+
+    let anchor = app
+        .profile_menu_anchor
+        .unwrap_or_else(|| egui::pos2(24.0, 84.0));
+
+    egui::Area::new("chat_avatar_menu".into())
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(140.0);
+
+                if ui.button("Settings").clicked() {
+                    app.show_settings = true;
+                    app.profile_menu_open = false;
+                }
+
+                if ui.button("Log out").clicked() {
+                    app.profile_menu_open = false;
+                    app.logout();
+                }
+            });
+        });
+}
+
 pub(crate) fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(70.0);
@@ -28,8 +66,16 @@ pub(crate) fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            render_chat_avatar_button(app, ui);
+        });
+    });
+    ui.add_space(6.0);
+
     if app.active_conversation_id.is_none() && app.conversations.is_empty() && !app.creating_new_chat {
         render_empty_state(app, ui);
+        render_avatar_menu(app, ui.ctx());
         return;
     }
 
@@ -39,6 +85,7 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
             ui.spinner();
             ui.label("Creating chat...");
         });
+        render_avatar_menu(app, ui.ctx());
         return;
     }
 
@@ -48,6 +95,7 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
             ui.heading("Select a chat");
             ui.label("Choose a conversation from the sidebar or start a new chat.");
         });
+        render_avatar_menu(app, ui.ctx());
         return;
     };
 
@@ -128,4 +176,6 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
     if send_clicked {
         app.send_message();
     }
+
+    render_avatar_menu(app, ui.ctx());
 }

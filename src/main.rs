@@ -7,6 +7,7 @@ mod provider;
 mod ui;
 
 use api::conversations::{self, Conversation, Message};
+use api::profile::{self, Profile};
 use eframe::egui;
 use cache::model_metadata::ModelMetadataCache;
 use provider::{create_default_provider, Provider};
@@ -36,6 +37,73 @@ enum SupabaseEvent {
         conversation_id: Uuid,
         title: String,
     },
+    ProfileLoaded(Result<Profile, String>),
+    DisplayNameUpdated(Result<Profile, String>),
+    ThemeUpdated(Result<Profile, String>),
+    EmailUpdated(Result<String, String>),
+    PasswordUpdated(Result<(), String>),
+    AvatarUploaded(Result<String, String>),
+    AvatarUrlUpdated(Result<Profile, String>),
+    AvatarDownloaded(Result<(String, Vec<u8>), String>),
+    AccountDeleted(Result<(), String>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SettingsStatus {
+    pub(crate) message: String,
+    pub(crate) is_error: bool,
+    pub(crate) expires_at: Option<Instant>,
+}
+
+impl SettingsStatus {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_error: false,
+            expires_at: None,
+        }
+    }
+
+    fn success_for(message: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            message: message.into(),
+            is_error: false,
+            expires_at: Some(Instant::now() + duration),
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_error: true,
+            expires_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn from_profile(value: Option<&str>) -> Self {
+        match value.unwrap_or("system").to_ascii_lowercase().as_str() {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,14 +134,26 @@ pub(crate) struct AuvroApp {
     pub(crate) user_full_name: Option<String>,
     pub(crate) auth_error: Option<String>,
     pub(crate) profile_menu_open: bool,
-    pub(crate) settings_open: bool,
-    pub(crate) settings_notice: Option<String>,
+    pub(crate) show_settings: bool,
+    pub(crate) settings_name_status: Option<SettingsStatus>,
+    pub(crate) settings_email_status: Option<SettingsStatus>,
+    pub(crate) settings_password_status: Option<SettingsStatus>,
+    pub(crate) settings_photo_status: Option<SettingsStatus>,
+    pub(crate) settings_theme_status: Option<SettingsStatus>,
+    pub(crate) settings_account_status: Option<SettingsStatus>,
     pub(crate) settings_name_draft: String,
     pub(crate) settings_email_draft: String,
     pub(crate) settings_password_draft: String,
-    pub(crate) selected_model_id: String,
+    pub(crate) settings_password_confirm_draft: String,
+    pub(crate) delete_account_confirmation: String,
+    pub(crate) theme_preference: ThemePreference,
+    pub(crate) profile: Option<Profile>,
+    pub(crate) avatar_texture: Option<egui::TextureHandle>,
+    #[allow(dead_code)]
     pub(crate) model_cache: ModelMetadataCache,
     pub(crate) is_loading: bool,
+    pub(crate) profile_loading: bool,
+    pub(crate) profile_menu_anchor: Option<egui::Pos2>,
     pub(crate) error_message: Option<String>,
     pub(crate) pending_response: Option<Vec<char>>,
     pub(crate) streamed_chars: usize,
@@ -142,7 +222,6 @@ impl Default for AuvroApp {
 
         let settings_name_draft = user_full_name.clone().unwrap_or_default();
         let settings_email_draft = user_email.clone().unwrap_or_default();
-        let selected_model_id = crate::env::OPENROUTER_MODEL.to_owned();
 
         let mut app = Self {
             provider: create_default_provider(),
@@ -166,14 +245,25 @@ impl Default for AuvroApp {
             user_full_name,
             auth_error,
             profile_menu_open: false,
-            settings_open: false,
-            settings_notice: None,
+            show_settings: false,
+            settings_name_status: None,
+            settings_email_status: None,
+            settings_password_status: None,
+            settings_photo_status: None,
+            settings_theme_status: None,
+            settings_account_status: None,
             settings_name_draft,
             settings_email_draft,
             settings_password_draft: String::new(),
-            selected_model_id,
+            settings_password_confirm_draft: String::new(),
+            delete_account_confirmation: String::new(),
+            theme_preference: ThemePreference::System,
+            profile: None,
+            avatar_texture: None,
             model_cache: ModelMetadataCache::new(Duration::from_secs(600)),
             is_loading: false,
+            profile_loading: false,
+            profile_menu_anchor: None,
             error_message: None,
             pending_response: None,
             streamed_chars: 0,
@@ -188,6 +278,7 @@ impl Default for AuvroApp {
 
         if app.is_authenticated {
             app.request_list_conversations();
+            app.request_load_profile();
         }
 
         app
@@ -284,6 +375,279 @@ impl AuvroApp {
         SecretStore::new("AuvroAI")
             .get("SUPABASE_ACCESS_TOKEN")
             .map_err(|_| "Missing auth session token. Please log in again.".to_owned())
+    }
+
+    fn current_user_uuid(&self) -> Result<Uuid, String> {
+        let user_id = self
+            .user_id
+            .as_deref()
+            .ok_or_else(|| "Missing user id. Please log in again.".to_owned())?;
+        Uuid::parse_str(user_id).map_err(|err| format!("Invalid user id '{user_id}': {err}"))
+    }
+
+    fn expire_settings_statuses(&mut self) {
+        let now = Instant::now();
+        for status in [
+            &mut self.settings_name_status,
+            &mut self.settings_email_status,
+            &mut self.settings_password_status,
+            &mut self.settings_photo_status,
+            &mut self.settings_theme_status,
+            &mut self.settings_account_status,
+        ] {
+            let expired = status
+                .as_ref()
+                .and_then(|s| s.expires_at)
+                .is_some_and(|expires_at| expires_at <= now);
+            if expired {
+                *status = None;
+            }
+        }
+    }
+
+    fn request_load_profile(&mut self) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
+
+        let user_id = match self.current_user_uuid() {
+            Ok(user_id) => user_id,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || profile::get_profile(&token, user_id))
+                .await
+                .map_err(|err| format!("Failed to run profile-load task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ProfileLoaded(result));
+        });
+    }
+
+    fn request_update_display_name(&mut self, display_name: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_name_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        let user_id = match self.current_user_uuid() {
+            Ok(user_id) => user_id,
+            Err(err) => {
+                self.settings_name_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                profile::update_display_name(&token, user_id, &display_name)
+            })
+            .await
+            .map_err(|err| format!("Failed to run display-name update task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::DisplayNameUpdated(result));
+        });
+    }
+
+    fn request_update_theme(&mut self, theme: ThemePreference) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_theme_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        let user_id = match self.current_user_uuid() {
+            Ok(user_id) => user_id,
+            Err(err) => {
+                self.settings_theme_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                profile::update_theme(&token, user_id, theme.as_str())
+            })
+            .await
+            .map_err(|err| format!("Failed to run theme-update task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::ThemeUpdated(result));
+        });
+    }
+
+    fn request_update_email(&mut self, new_email: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_email_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let email = new_email.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                profile::update_email(&token, &new_email)?;
+                Ok::<String, String>(email)
+            })
+            .await
+            .map_err(|err| format!("Failed to run email-update task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::EmailUpdated(result));
+        });
+    }
+
+    fn request_update_password(&mut self, new_password: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_password_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || profile::update_password(&token, &new_password))
+                .await
+                .map_err(|err| format!("Failed to run password-update task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::PasswordUpdated(result));
+        });
+    }
+
+    fn request_upload_avatar(&mut self, image_bytes: Vec<u8>, mime: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_photo_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        let user_id = match self.current_user_uuid() {
+            Ok(user_id) => user_id,
+            Err(err) => {
+                self.settings_photo_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                profile::upload_avatar(&token, user_id, image_bytes, &mime)
+            })
+            .await
+            .map_err(|err| format!("Failed to run avatar-upload task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::AvatarUploaded(result));
+        });
+    }
+
+    fn request_update_avatar_url(&mut self, avatar_url: String) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_photo_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        let user_id = match self.current_user_uuid() {
+            Ok(user_id) => user_id,
+            Err(err) => {
+                self.settings_photo_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                profile::update_avatar_url(&token, user_id, &avatar_url)
+            })
+            .await
+            .map_err(|err| format!("Failed to run avatar-url update task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::AvatarUrlUpdated(result));
+        });
+    }
+
+    fn request_download_avatar(&self, avatar_url: String) {
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let url = avatar_url.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let bytes = profile::download_avatar(&avatar_url)?;
+                Ok::<(String, Vec<u8>), String>((url, bytes))
+            })
+            .await
+            .map_err(|err| format!("Failed to run avatar-download task: {err}"))
+            .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::AvatarDownloaded(result));
+        });
+    }
+
+    pub(crate) fn request_delete_account(&mut self) {
+        let token = match self.access_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.settings_account_status = Some(SettingsStatus::error(err));
+                return;
+            }
+        };
+
+        self.profile_loading = true;
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || profile::delete_account(&token))
+                .await
+                .map_err(|err| format!("Failed to run account-delete task: {err}"))
+                .and_then(|result| result);
+            let _ = tx.send(SupabaseEvent::AccountDeleted(result));
+        });
+    }
+
+    fn decode_avatar_image(bytes: &[u8]) -> Result<egui::ColorImage, String> {
+        let decoded = image::load_from_memory(bytes)
+            .map_err(|err| format!("Failed to decode avatar image: {err}"))?
+            .to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let pixels = decoded.into_raw();
+        Ok(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
     }
 
     fn request_list_conversations(&mut self) {
@@ -462,7 +826,7 @@ impl AuvroApp {
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     }
 
-    fn process_supabase_events(&mut self) {
+    fn process_supabase_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.supabase_events_rx.try_recv() {
             match event {
                 SupabaseEvent::ConversationsLoaded(result) => match result {
@@ -563,181 +927,239 @@ impl AuvroApp {
                         self.sort_conversations_desc();
                     }
                 }
+                SupabaseEvent::ProfileLoaded(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(profile) => {
+                            let avatar_url = profile.avatar_url.clone();
+                            let display_name = profile.display_name.clone();
+                            let theme = profile.theme.clone();
+                            self.profile = Some(profile);
+
+                            if let Some(name) = display_name.filter(|name| !name.trim().is_empty()) {
+                                self.settings_name_draft = name.clone();
+                                self.user_full_name = Some(name);
+                            }
+
+                            self.theme_preference = ThemePreference::from_profile(theme.as_deref());
+
+                            if let Some(url) = avatar_url.filter(|url| !url.trim().is_empty()) {
+                                self.request_download_avatar(url);
+                            } else {
+                                self.avatar_texture = None;
+                            }
+                        }
+                        Err(err) => self.error_message = Some(err),
+                    }
+                }
+                SupabaseEvent::DisplayNameUpdated(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(profile) => {
+                            if let Some(name) = profile.display_name.clone().filter(|name| !name.trim().is_empty()) {
+                                self.user_full_name = Some(name.clone());
+                                self.settings_name_draft = name;
+                            }
+
+                            self.profile = Some(profile);
+                            self.settings_name_status = Some(SettingsStatus::success_for(
+                                "Saved",
+                                Duration::from_secs(2),
+                            ));
+                        }
+                        Err(err) => self.settings_name_status = Some(SettingsStatus::error(err)),
+                    }
+                }
+                SupabaseEvent::ThemeUpdated(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(profile) => {
+                            self.theme_preference = ThemePreference::from_profile(profile.theme.as_deref());
+                            self.profile = Some(profile);
+                            self.settings_theme_status = Some(SettingsStatus::success("Theme saved."));
+                        }
+                        Err(err) => self.settings_theme_status = Some(SettingsStatus::error(err)),
+                    }
+                }
+                SupabaseEvent::EmailUpdated(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(email) => {
+                            self.user_email = Some(email.clone());
+                            self.settings_email_draft = email;
+                            self.settings_email_status = Some(SettingsStatus::success(
+                                "Email update requested. Check your inbox to confirm.",
+                            ));
+                        }
+                        Err(err) => self.settings_email_status = Some(SettingsStatus::error(err)),
+                    }
+                }
+                SupabaseEvent::PasswordUpdated(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(()) => {
+                            self.settings_password_draft.clear();
+                            self.settings_password_confirm_draft.clear();
+                            self.settings_password_status = Some(SettingsStatus::success(
+                                "Password changed successfully.",
+                            ));
+                        }
+                        Err(err) => {
+                            self.settings_password_status = Some(SettingsStatus::error(err))
+                        }
+                    }
+                }
+                SupabaseEvent::AvatarUploaded(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(url) => self.request_update_avatar_url(url),
+                        Err(err) => self.settings_photo_status = Some(SettingsStatus::error(err)),
+                    }
+                }
+                SupabaseEvent::AvatarUrlUpdated(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(profile) => {
+                            let avatar_url = profile.avatar_url.clone();
+                            self.profile = Some(profile);
+                            if let Some(url) = avatar_url.filter(|url| !url.trim().is_empty()) {
+                                self.request_download_avatar(url);
+                            }
+                            self.settings_photo_status = Some(SettingsStatus::success("Photo updated."));
+                        }
+                        Err(err) => self.settings_photo_status = Some(SettingsStatus::error(err)),
+                    }
+                }
+                SupabaseEvent::AvatarDownloaded(result) => match result {
+                    Ok((url, bytes)) => {
+                        let current_avatar = self
+                            .profile
+                            .as_ref()
+                            .and_then(|profile| profile.avatar_url.as_deref())
+                            .map(str::to_owned);
+
+                        if current_avatar.as_deref() == Some(url.as_str()) {
+                            if let Ok(color_image) = Self::decode_avatar_image(&bytes) {
+                                let texture = ctx.load_texture(
+                                    format!("avatar-{}", url),
+                                    color_image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.avatar_texture = Some(texture);
+                            }
+                        }
+                    }
+                    Err(err) => self.settings_photo_status = Some(SettingsStatus::error(err)),
+                },
+                SupabaseEvent::AccountDeleted(result) => {
+                    self.profile_loading = false;
+                    match result {
+                        Ok(()) => {
+                            self.logout();
+                            self.auth_notice = Some("Account deleted.".to_owned());
+                        }
+                        Err(err) => self.settings_account_status = Some(SettingsStatus::error(err)),
+                    }
+                }
             }
         }
-    }
-
-    fn update_supabase_user(
-        &self,
-        access_token: &str,
-        payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let endpoint = format!("{}/user", crate::env::supabase_auth_url());
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|err| err.to_string())?;
-
-        let response = client
-            .put(endpoint)
-            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .json(payload)
-            .send()
-            .map_err(|err| err.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Update failed ({status}): {text}"));
-        }
-
-        response.json().map_err(|err| err.to_string())
-    }
-
-    pub(crate) fn save_selected_model_id(&self) -> Result<(), String> {
-        let user_id = self
-            .user_id
-            .as_deref()
-            .ok_or_else(|| "Missing user id. Please log in again.".to_owned())?;
-        let access_token = self.access_token()?;
-
-        let endpoint = format!("{}/user_settings", crate::env::supabase_rest_url());
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let response = client
-            .post(endpoint)
-            .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .header("Prefer", "resolution=merge-duplicates")
-            .json(&serde_json::json!({
-                "user_id": user_id,
-                "selected_model_id": self.selected_model_id,
-            }))
-            .send()
-            .map_err(|e| e.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().unwrap_or_default();
-            return Err(format!("Failed to save selected model ({status}): {text}"));
-        }
-
-        Ok(())
     }
 
     pub(crate) fn save_profile_name(&mut self) {
-        let full_name = self.settings_name_draft.trim().to_owned();
-        if full_name.is_empty() {
-            self.settings_notice = Some("Name cannot be empty.".to_owned());
+        let new_name = self.settings_name_draft.trim().to_owned();
+        let current_name = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.display_name.clone())
+            .unwrap_or_default();
+
+        if new_name.is_empty() {
+            self.settings_name_status = Some(SettingsStatus::error("Display name cannot be empty."));
             return;
         }
 
-        let access_token = match self.access_token() {
-            Ok(token) => token,
-            Err(err) => {
-                self.settings_notice = Some(err);
-                return;
-            }
-        };
-
-        let payload = serde_json::json!({
-            "data": { "full_name": full_name },
-        });
-
-        match self.update_supabase_user(&access_token, &payload) {
-            Ok(body) => {
-                self.user_full_name = Self::extract_full_name(&body);
-                if self.user_full_name.is_none() {
-                    self.user_full_name = Some(self.settings_name_draft.trim().to_owned());
-                }
-                self.settings_notice = Some("Profile name updated.".to_owned());
-            }
-            Err(err) => self.settings_notice = Some(err),
+        if new_name == current_name.trim() {
+            return;
         }
+
+        self.settings_name_status = None;
+        self.request_update_display_name(new_name);
+    }
+
+    pub(crate) fn save_theme_preference(&mut self) {
+        self.settings_theme_status = None;
+        self.request_update_theme(self.theme_preference);
     }
 
     pub(crate) fn change_account_email(&mut self) {
         let email = self.settings_email_draft.trim().to_owned();
-        if email.is_empty() || !email.contains('@') {
-            self.settings_notice = Some("Enter a valid email address.".to_owned());
+        if email.is_empty() || !email.contains('@') || !email.contains('.') {
+            self.settings_email_status = Some(SettingsStatus::error("Enter a valid email address."));
             return;
         }
 
-        let access_token = match self.access_token() {
-            Ok(token) => token,
-            Err(err) => {
-                self.settings_notice = Some(err);
-                return;
-            }
-        };
-
-        let payload = serde_json::json!({ "email": email });
-
-        match self.update_supabase_user(&access_token, &payload) {
-            Ok(body) => {
-                self.user_email = body
-                    .get("email")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_owned())
-                    .or_else(|| Some(self.settings_email_draft.trim().to_owned()));
-                self.settings_notice = Some(
-                    "Email update requested. Supabase may require email verification.".to_owned(),
-                );
-            }
-            Err(err) => self.settings_notice = Some(err),
+        let current_email = self.user_email.clone().unwrap_or_default();
+        if email == current_email.trim() {
+            return;
         }
+
+        self.settings_email_status = None;
+        self.request_update_email(email);
     }
 
     pub(crate) fn change_account_password(&mut self) {
         let password = self.settings_password_draft.clone();
-        if password.trim().len() < 6 {
-            self.settings_notice = Some("Password must be at least 6 characters.".to_owned());
+        if password.trim().len() < 8 {
+            self.settings_password_status =
+                Some(SettingsStatus::error("Password must be at least 8 characters."));
             return;
         }
 
-        let access_token = match self.access_token() {
-            Ok(token) => token,
+        if password != self.settings_password_confirm_draft {
+            self.settings_password_status = Some(SettingsStatus::error("Passwords do not match."));
+            return;
+        }
+
+        self.settings_password_status = None;
+        self.request_update_password(password);
+    }
+
+    pub(crate) fn pick_and_upload_avatar(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("image", &["png", "jpg", "jpeg"])
+            .pick_file();
+
+        let Some(file) = file else {
+            return;
+        };
+
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
             Err(err) => {
-                self.settings_notice = Some(err);
+                self.settings_photo_status =
+                    Some(SettingsStatus::error(format!("Failed to read selected file: {err}")));
                 return;
             }
         };
 
-        let payload = serde_json::json!({ "password": password });
+        let mime = file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .map(|ext| {
+                if ext == "png" {
+                    "image/png".to_owned()
+                } else {
+                    "image/jpeg".to_owned()
+                }
+            })
+            .unwrap_or_else(|| "image/jpeg".to_owned());
 
-        match self.update_supabase_user(&access_token, &payload) {
-            Ok(_) => {
-                self.settings_password_draft.clear();
-                self.settings_notice = Some("Password changed successfully.".to_owned());
-            }
-            Err(err) => self.settings_notice = Some(err),
-        }
+        self.settings_photo_status = Some(SettingsStatus::success("Uploading photo..."));
+        self.request_upload_avatar(bytes, mime);
     }
 
     pub(crate) fn profile_initials(&self) -> String {
-        if let Some(full_name) = &self.user_full_name {
-            let mut parts = full_name.split_whitespace();
-            if let Some(first) = parts.next() {
-                let first_char = first.chars().next().unwrap_or('U');
-                if let Some(last) = parts.last() {
-                    let second_char = last.chars().next().unwrap_or(first_char);
-                    return format!(
-                        "{}{}",
-                        first_char.to_ascii_uppercase(),
-                        second_char.to_ascii_uppercase()
-                    );
-                }
-
-                return first_char.to_ascii_uppercase().to_string();
-            }
-        }
-
         self.user_email
             .as_deref()
             .and_then(|email| email.chars().next())
@@ -745,10 +1167,37 @@ impl AuvroApp {
             .unwrap_or_else(|| "U".to_owned())
     }
 
-    pub(crate) fn render_profile_avatar(ui: &mut egui::Ui, initials: &str, radius: f32) {
+    pub(crate) fn render_profile_avatar(
+        &self,
+        ui: &mut egui::Ui,
+        initials: &str,
+        radius: f32,
+        clickable: bool,
+    ) -> egui::Response {
         let size = egui::vec2(radius * 2.0, radius * 2.0);
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(
+            size,
+            if clickable {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
         let painter = ui.painter();
+
+        if let Some(texture) = &self.avatar_texture {
+            let image = egui::Image::new((texture.id(), size))
+                .fit_to_exact_size(size)
+                .corner_radius(egui::CornerRadius::same(radius.round() as u8));
+            image.paint_at(ui, rect);
+            painter.circle_stroke(
+                rect.center(),
+                radius,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 44, 78)),
+            );
+            return response;
+        }
+
         painter.circle_filled(rect.center(), radius, egui::Color32::from_rgb(58, 86, 124));
         painter.circle_stroke(
             rect.center(),
@@ -762,14 +1211,7 @@ impl AuvroApp {
             egui::FontId::proportional(radius * 0.72),
             egui::Color32::WHITE,
         );
-    }
-
-    fn render_account_menu(&mut self, ctx: &egui::Context) {
-        ui::settings::render_account_menu(self, ctx);
-    }
-
-    fn render_settings_window(&mut self, ctx: &egui::Context) {
-        ui::settings::render_settings_window(self, ctx);
+        response
     }
 
     pub(crate) fn login_with_email(&mut self) {
@@ -848,12 +1290,28 @@ impl AuvroApp {
         self.user_full_name = user_full_name;
         self.settings_email_draft = user_email.clone();
         self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
+        self.settings_password_confirm_draft.clear();
+        self.delete_account_confirmation.clear();
+        self.theme_preference = ThemePreference::System;
+        self.profile = None;
+        self.avatar_texture = None;
+        self.profile_loading = false;
+        self.profile_menu_open = false;
+        self.profile_menu_anchor = None;
+        self.show_settings = false;
+        self.settings_name_status = None;
+        self.settings_email_status = None;
+        self.settings_password_status = None;
+        self.settings_photo_status = None;
+        self.settings_theme_status = None;
+        self.settings_account_status = None;
         self.conversations.clear();
         self.active_conversation_id = None;
         self.messages.clear();
         self.messages_loading = false;
         if user_id.is_some() {
             self.request_list_conversations();
+            self.request_load_profile();
         }
         self.auth_password.clear();
         self.auth_notice = Some(format!("Logged in as {user_email}"));
@@ -953,6 +1411,21 @@ impl AuvroApp {
             self.user_full_name = user_full_name;
             self.settings_email_draft = user_email.clone();
             self.settings_name_draft = self.user_full_name.clone().unwrap_or_default();
+            self.settings_password_confirm_draft.clear();
+            self.delete_account_confirmation.clear();
+            self.theme_preference = ThemePreference::System;
+            self.profile = None;
+            self.avatar_texture = None;
+            self.profile_loading = false;
+            self.profile_menu_open = false;
+            self.profile_menu_anchor = None;
+            self.show_settings = false;
+            self.settings_name_status = None;
+            self.settings_email_status = None;
+            self.settings_password_status = None;
+            self.settings_photo_status = None;
+            self.settings_theme_status = None;
+            self.settings_account_status = None;
             self.conversations.clear();
             self.active_conversation_id = None;
             self.messages.clear();
@@ -961,6 +1434,7 @@ impl AuvroApp {
             self.auth_password.clear();
             self.auth_confirm_password.clear();
             self.request_list_conversations();
+            self.request_load_profile();
             self.auth_notice = Some(format!("Signup successful. Logged in as {user_email}"));
         } else {
             self.auth_notice = Some(
@@ -981,16 +1455,26 @@ impl AuvroApp {
         self.active_conversation_id = None;
         self.messages.clear();
         self.messages_loading = false;
+        self.profile = None;
+        self.avatar_texture = None;
+        self.profile_loading = false;
         self.pending_title_generation = None;
         self.pending_delete_conversation_id = None;
         self.creating_new_chat = false;
         self.profile_menu_open = false;
-        self.settings_open = false;
-        self.settings_notice = None;
+        self.profile_menu_anchor = None;
+        self.show_settings = false;
+        self.settings_name_status = None;
+        self.settings_email_status = None;
+        self.settings_password_status = None;
+        self.settings_photo_status = None;
+        self.settings_theme_status = None;
+        self.settings_account_status = None;
         self.settings_name_draft.clear();
         self.settings_email_draft.clear();
         self.settings_password_draft.clear();
-        self.selected_model_id.clear();
+        self.settings_password_confirm_draft.clear();
+        self.delete_account_confirmation.clear();
         self.auth_password.clear();
         self.auth_confirm_password.clear();
         self.auth_notice = Some("Logged out.".to_owned());
@@ -1020,6 +1504,9 @@ impl AuvroApp {
 
     pub(crate) fn start_new_chat(&mut self) {
         self.error_message = None;
+        self.show_settings = false;
+        self.profile_menu_open = false;
+        self.profile_menu_anchor = None;
         self.creating_new_chat = true;
         self.active_conversation_id = None;
         self.messages.clear();
@@ -1030,6 +1517,9 @@ impl AuvroApp {
     }
 
     pub(crate) fn select_conversation(&mut self, conversation_id: Uuid) {
+        self.show_settings = false;
+        self.profile_menu_open = false;
+        self.profile_menu_anchor = None;
         self.active_conversation_id = Some(conversation_id);
         self.creating_new_chat = false;
         self.messages.clear();
@@ -1154,57 +1644,68 @@ impl AuvroApp {
 
 impl eframe::App for AuvroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_supabase_events();
+        self.expire_settings_statuses();
+        self.process_supabase_events(ctx);
         self.tick_streaming(ctx);
 
-        ctx.set_visuals(egui::Visuals {
-            panel_fill: egui::Color32::from_rgb(245, 247, 250),
-            window_fill: egui::Color32::from_rgb(250, 251, 253),
-            override_text_color: Some(egui::Color32::from_rgb(28, 31, 35)),
-            widgets: egui::style::Widgets {
-                noninteractive: egui::style::WidgetVisuals {
-                    bg_fill: egui::Color32::from_rgb(235, 239, 245),
-                    weak_bg_fill: egui::Color32::from_rgb(235, 239, 245),
-                    bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                    corner_radius: egui::CornerRadius::same(6),
-                    fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                    expansion: 0.0,
+        let dark_mode = match self.theme_preference {
+            ThemePreference::Dark => true,
+            ThemePreference::Light => false,
+            ThemePreference::System => matches!(ctx.system_theme(), Some(egui::Theme::Dark)),
+        };
+
+        if dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals {
+                panel_fill: egui::Color32::from_rgb(245, 247, 250),
+                window_fill: egui::Color32::from_rgb(250, 251, 253),
+                override_text_color: Some(egui::Color32::from_rgb(28, 31, 35)),
+                widgets: egui::style::Widgets {
+                    noninteractive: egui::style::WidgetVisuals {
+                        bg_fill: egui::Color32::from_rgb(235, 239, 245),
+                        weak_bg_fill: egui::Color32::from_rgb(235, 239, 245),
+                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
+                        corner_radius: egui::CornerRadius::same(6),
+                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
+                        expansion: 0.0,
+                    },
+                    inactive: egui::style::WidgetVisuals {
+                        bg_fill: egui::Color32::from_rgb(255, 255, 255),
+                        weak_bg_fill: egui::Color32::from_rgb(255, 255, 255),
+                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
+                        corner_radius: egui::CornerRadius::same(6),
+                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
+                        expansion: 0.0,
+                    },
+                    hovered: egui::style::WidgetVisuals {
+                        bg_fill: egui::Color32::from_rgb(225, 232, 241),
+                        weak_bg_fill: egui::Color32::from_rgb(225, 232, 241),
+                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(145, 155, 168)),
+                        corner_radius: egui::CornerRadius::same(6),
+                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
+                        expansion: 0.0,
+                    },
+                    active: egui::style::WidgetVisuals {
+                        bg_fill: egui::Color32::from_rgb(208, 219, 231),
+                        weak_bg_fill: egui::Color32::from_rgb(208, 219, 231),
+                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(114, 126, 142)),
+                        corner_radius: egui::CornerRadius::same(6),
+                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
+                        expansion: 0.0,
+                    },
+                    open: egui::style::WidgetVisuals {
+                        bg_fill: egui::Color32::from_rgb(245, 247, 250),
+                        weak_bg_fill: egui::Color32::from_rgb(245, 247, 250),
+                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
+                        corner_radius: egui::CornerRadius::same(6),
+                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
+                        expansion: 0.0,
+                    },
                 },
-                inactive: egui::style::WidgetVisuals {
-                    bg_fill: egui::Color32::from_rgb(255, 255, 255),
-                    weak_bg_fill: egui::Color32::from_rgb(255, 255, 255),
-                    bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                    corner_radius: egui::CornerRadius::same(6),
-                    fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                    expansion: 0.0,
-                },
-                hovered: egui::style::WidgetVisuals {
-                    bg_fill: egui::Color32::from_rgb(225, 232, 241),
-                    weak_bg_fill: egui::Color32::from_rgb(225, 232, 241),
-                    bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(145, 155, 168)),
-                    corner_radius: egui::CornerRadius::same(6),
-                    fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                    expansion: 0.0,
-                },
-                active: egui::style::WidgetVisuals {
-                    bg_fill: egui::Color32::from_rgb(208, 219, 231),
-                    weak_bg_fill: egui::Color32::from_rgb(208, 219, 231),
-                    bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(114, 126, 142)),
-                    corner_radius: egui::CornerRadius::same(6),
-                    fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                    expansion: 0.0,
-                },
-                open: egui::style::WidgetVisuals {
-                    bg_fill: egui::Color32::from_rgb(245, 247, 250),
-                    weak_bg_fill: egui::Color32::from_rgb(245, 247, 250),
-                    bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                    corner_radius: egui::CornerRadius::same(6),
-                    fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                    expansion: 0.0,
-                },
-            },
-            ..egui::Visuals::light()
-        });
+                ..egui::Visuals::light()
+            });
+        }
 
         ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 10.0);
@@ -1243,19 +1744,6 @@ impl eframe::App for AuvroApp {
                         .as_deref()
                         .unwrap_or("authenticated user");
                     ui.label(format!("Signed in: {email}"));
-
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let initials = self.profile_initials();
-                            let button = egui::Button::new(initials)
-                                .min_size(egui::vec2(34.0, 34.0))
-                                .corner_radius(egui::CornerRadius::same(17));
-                            if ui.add(button).clicked() {
-                                self.profile_menu_open = true;
-                            }
-                        },
-                    );
                 }
             });
         });
@@ -1274,18 +1762,19 @@ impl eframe::App for AuvroApp {
                 .resizable(true)
                 .default_width(220.0)
                 .show(ctx, |ui| {
-                    ui::sidebar::render_sessions(self, ui);
+                    ui::sidebar::render_sessions(self, ui, ctx);
                 });
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui::chat::render_chat_panel(self, ui);
+            if self.show_settings {
+                ui::settings::render_settings_screen(self, ui);
+            } else {
+                ui::chat::render_chat_panel(self, ui);
+            }
         });
 
         ui::sidebar::render_delete_confirmation(self, ctx);
-
-        self.render_account_menu(ctx);
-        self.render_settings_window(ctx);
     }
 }
 

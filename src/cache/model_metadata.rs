@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // Before: app startup could eagerly fetch model metadata, increasing cold-start latency.
 // After: metadata is lazy-loaded only when Settings opens, then cached in memory with TTL.
 

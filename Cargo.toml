@@ -21,3 +21,5 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+rfd = "0.14"
+image = { version = "0.25", default-features = true }
