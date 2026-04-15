@@ -234,7 +234,7 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                                         .color(egui::Color32::WHITE)
                                         .strong(),
                                 )
-                                .fill(ui.visuals().selection.bg_fill)
+                                .fill(egui::Color32::from_rgb(135, 206, 235))
                                 .stroke(egui::Stroke::NONE)
                                 .corner_radius(egui::CornerRadius::same(8)),
                             )

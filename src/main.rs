@@ -135,6 +135,7 @@ pub(crate) struct AuvroApp {
     pub(crate) auth_error: Option<String>,
     pub(crate) profile_menu_open: bool,
     pub(crate) show_settings: bool,
+    pub(crate) show_sidebar: bool,
     pub(crate) settings_name_status: Option<SettingsStatus>,
     pub(crate) settings_email_status: Option<SettingsStatus>,
     pub(crate) settings_password_status: Option<SettingsStatus>,
@@ -246,6 +247,7 @@ impl Default for AuvroApp {
             auth_error,
             profile_menu_open: false,
             show_settings: false,
+            show_sidebar: true,
             settings_name_status: None,
             settings_email_status: None,
             settings_password_status: None,
@@ -1502,6 +1504,70 @@ impl AuvroApp {
         format!("{trimmed}...")
     }
 
+    fn apply_app_theme(&self, ctx: &egui::Context) {
+        let dark_mode = match self.theme_preference {
+            ThemePreference::Dark => true,
+            ThemePreference::Light => false,
+            ThemePreference::System => matches!(ctx.system_theme(), Some(egui::Theme::Dark)),
+        };
+
+        let mut visuals = if dark_mode {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(10, 13, 18);
+            visuals.window_fill = egui::Color32::from_rgb(14, 18, 24);
+            visuals.faint_bg_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 6);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(6, 8, 11);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(229, 232, 238));
+            visuals.selection.bg_fill = egui::Color32::from_rgb(66, 78, 104);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(98, 116, 152));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgba_premultiplied(255, 255, 255, 0);
+            visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgba_premultiplied(255, 255, 255, 0);
+            visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 18));
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_premultiplied(18, 22, 29, 220);
+            visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgba_premultiplied(18, 22, 29, 220);
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 18));
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_premultiplied(26, 31, 41, 230);
+            visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgba_premultiplied(26, 31, 41, 230);
+            visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 28));
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgba_premultiplied(34, 40, 52, 240);
+            visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgba_premultiplied(34, 40, 52, 240);
+            visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 36));
+            visuals
+        } else {
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(244, 246, 249);
+            visuals.window_fill = egui::Color32::from_rgb(250, 251, 253);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(28, 31, 35));
+            visuals.selection.bg_fill = egui::Color32::from_rgb(208, 219, 231);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(114, 126, 142));
+            visuals
+        };
+
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
+        visuals.widgets.open.corner_radius = egui::CornerRadius::same(8);
+
+        ctx.set_visuals(visuals);
+
+        ctx.style_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+            style.spacing.button_padding = egui::vec2(12.0, 8.0);
+            style.spacing.indent = 16.0;
+            style.spacing.interact_size = egui::vec2(44.0, 30.0);
+            style.text_styles = [
+                (egui::TextStyle::Heading, egui::FontId::proportional(26.0)),
+                (egui::TextStyle::Name("PanelTitle".into()), egui::FontId::proportional(20.0)),
+                (egui::TextStyle::Body, egui::FontId::proportional(16.0)),
+                (egui::TextStyle::Button, egui::FontId::proportional(15.0)),
+                (egui::TextStyle::Monospace, egui::FontId::monospace(15.0)),
+                (egui::TextStyle::Small, egui::FontId::proportional(13.0)),
+            ]
+            .into();
+        });
+    }
+
     pub(crate) fn start_new_chat(&mut self) {
         self.error_message = None;
         self.show_settings = false;
@@ -1648,105 +1714,47 @@ impl eframe::App for AuvroApp {
         self.process_supabase_events(ctx);
         self.tick_streaming(ctx);
 
-        let dark_mode = match self.theme_preference {
-            ThemePreference::Dark => true,
-            ThemePreference::Light => false,
-            ThemePreference::System => matches!(ctx.system_theme(), Some(egui::Theme::Dark)),
-        };
-
-        if dark_mode {
-            ctx.set_visuals(egui::Visuals::dark());
-        } else {
-            ctx.set_visuals(egui::Visuals {
-                panel_fill: egui::Color32::from_rgb(245, 247, 250),
-                window_fill: egui::Color32::from_rgb(250, 251, 253),
-                override_text_color: Some(egui::Color32::from_rgb(28, 31, 35)),
-                widgets: egui::style::Widgets {
-                    noninteractive: egui::style::WidgetVisuals {
-                        bg_fill: egui::Color32::from_rgb(235, 239, 245),
-                        weak_bg_fill: egui::Color32::from_rgb(235, 239, 245),
-                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                        corner_radius: egui::CornerRadius::same(6),
-                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                        expansion: 0.0,
-                    },
-                    inactive: egui::style::WidgetVisuals {
-                        bg_fill: egui::Color32::from_rgb(255, 255, 255),
-                        weak_bg_fill: egui::Color32::from_rgb(255, 255, 255),
-                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                        corner_radius: egui::CornerRadius::same(6),
-                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                        expansion: 0.0,
-                    },
-                    hovered: egui::style::WidgetVisuals {
-                        bg_fill: egui::Color32::from_rgb(225, 232, 241),
-                        weak_bg_fill: egui::Color32::from_rgb(225, 232, 241),
-                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(145, 155, 168)),
-                        corner_radius: egui::CornerRadius::same(6),
-                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                        expansion: 0.0,
-                    },
-                    active: egui::style::WidgetVisuals {
-                        bg_fill: egui::Color32::from_rgb(208, 219, 231),
-                        weak_bg_fill: egui::Color32::from_rgb(208, 219, 231),
-                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(114, 126, 142)),
-                        corner_radius: egui::CornerRadius::same(6),
-                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                        expansion: 0.0,
-                    },
-                    open: egui::style::WidgetVisuals {
-                        bg_fill: egui::Color32::from_rgb(245, 247, 250),
-                        weak_bg_fill: egui::Color32::from_rgb(245, 247, 250),
-                        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(195, 203, 214)),
-                        corner_radius: egui::CornerRadius::same(6),
-                        fg_stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(28, 31, 35)),
-                        expansion: 0.0,
-                    },
-                },
-                ..egui::Visuals::light()
-            });
-        }
-
-        ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-            style.spacing.button_padding = egui::vec2(12.0, 8.0);
-            style.spacing.indent = 16.0;
-            style.spacing.interact_size = egui::vec2(44.0, 28.0);
-            style.text_styles = [
-                (
-                    egui::TextStyle::Heading,
-                    egui::FontId::proportional(26.0),
-                ),
-                (
-                    egui::TextStyle::Name("PanelTitle".into()),
-                    egui::FontId::proportional(20.0),
-                ),
-                (egui::TextStyle::Body, egui::FontId::proportional(16.0)),
-                (egui::TextStyle::Button, egui::FontId::proportional(15.0)),
-                (egui::TextStyle::Monospace, egui::FontId::monospace(15.0)),
-                (egui::TextStyle::Small, egui::FontId::proportional(13.0)),
-            ]
-            .into();
-        });
+        self.apply_app_theme(ctx);
 
         let window_width = ctx.input(|i| i.content_rect().width());
         let compact_layout = window_width < 980.0;
 
-        egui::TopBottomPanel::top("app_header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("AuvroAI");
-                ui.separator();
-                ui.label("Your AI Chat Assistant");
-                ui.separator();
-                if self.is_authenticated {
-                    let email = self
-                        .user_email
-                        .as_deref()
-                        .unwrap_or("authenticated user");
-                    ui.label(format!("Signed in: {email}"));
-                }
+        egui::TopBottomPanel::top("app_header")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 18),
+                    ))
+                    .inner_margin(egui::Margin::symmetric(18, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("AuvroAI").strong().size(18.0));
+                        ui.label(
+                            egui::RichText::new("Minimal, centered chat workspace")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.is_authenticated {
+                            let email = self
+                                .user_email
+                                .as_deref()
+                                .unwrap_or("authenticated user");
+                            ui.label(
+                                egui::RichText::new(format!("Signed in as {email}"))
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+                });
             });
-        });
 
         if !self.is_authenticated {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1755,12 +1763,10 @@ impl eframe::App for AuvroApp {
             return;
         }
 
-        if compact_layout {
-            ui::sidebar::render_compact_controls(self, ctx);
-        } else {
+        if self.show_sidebar {
             egui::SidePanel::left("session_sidebar")
                 .resizable(true)
-                .default_width(220.0)
+                .default_width(if compact_layout { 260.0 } else { 240.0 })
                 .show(ctx, |ui| {
                     ui::sidebar::render_sessions(self, ui, ctx);
                 });

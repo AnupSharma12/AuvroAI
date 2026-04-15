@@ -26,9 +26,17 @@ pub fn create_default_provider() -> Box<dyn Provider> {
     let openrouter = OpenRouterProvider::from_env().map(|provider| Box::new(provider) as Box<dyn Provider>);
 
     match (hackclub, openrouter) {
-        (Some(primary), Some(fallback)) => Box::new(FailoverProvider::new(primary, fallback)),
+        (Some(primary), Some(fallback)) => Box::new(FailoverProvider::new(
+            primary,
+            fallback,
+            Box::new(MockProvider),
+        )),
         (Some(primary), None) => primary,
-        (None, Some(fallback)) => fallback,
+        (None, Some(fallback)) => Box::new(FailoverProvider::new(
+            fallback,
+            Box::new(MockProvider),
+            Box::new(MockProvider),
+        )),
         (None, None) => Box::new(MockProvider),
     }
 }
@@ -36,11 +44,20 @@ pub fn create_default_provider() -> Box<dyn Provider> {
 struct FailoverProvider {
     primary: Box<dyn Provider>,
     fallback: Box<dyn Provider>,
+    tertiary: Box<dyn Provider>,
 }
 
 impl FailoverProvider {
-    fn new(primary: Box<dyn Provider>, fallback: Box<dyn Provider>) -> Self {
-        Self { primary, fallback }
+    fn new(
+        primary: Box<dyn Provider>,
+        fallback: Box<dyn Provider>,
+        tertiary: Box<dyn Provider>,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            tertiary,
+        }
     }
 }
 
@@ -55,14 +72,18 @@ impl Provider for FailoverProvider {
             Err(primary_err) => self
                 .fallback
                 .generate_reply(prompt, conversation)
-                .map_err(|fallback_err| {
-                    format!(
-                        "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}",
-                        self.primary.name(),
-                        primary_err,
-                        self.fallback.name(),
-                        fallback_err
-                    )
+                .or_else(|fallback_err| {
+                    self.tertiary.generate_reply(prompt, conversation).map_err(|tertiary_err| {
+                        format!(
+                            "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}. Local fallback '{}' also failed: {}",
+                            self.primary.name(),
+                            primary_err,
+                            self.fallback.name(),
+                            fallback_err,
+                            self.tertiary.name(),
+                            tertiary_err
+                        )
+                    })
                 }),
         }
     }
@@ -81,14 +102,20 @@ impl Provider for FailoverProvider {
             Err(primary_err) => self
                 .fallback
                 .generate_reply_with_system_prompt(system_prompt, prompt, conversation)
-                .map_err(|fallback_err| {
-                    format!(
-                        "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}",
-                        self.primary.name(),
-                        primary_err,
-                        self.fallback.name(),
-                        fallback_err
-                    )
+                .or_else(|fallback_err| {
+                    self.tertiary
+                        .generate_reply_with_system_prompt(system_prompt, prompt, conversation)
+                        .map_err(|tertiary_err| {
+                            format!(
+                                "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}. Local fallback '{}' also failed: {}",
+                                self.primary.name(),
+                                primary_err,
+                                self.fallback.name(),
+                                fallback_err,
+                                self.tertiary.name(),
+                                tertiary_err
+                            )
+                        })
                 }),
         }
     }
@@ -104,10 +131,8 @@ impl Provider for MockProvider {
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
         let previous_messages = conversation.len();
         Ok(format!(
-            "Streaming demo response from {}: I received '{}' with {} prior messages and this output is rendered token-by-token so the chat feels live.",
-            self.name(),
-            prompt,
-            previous_messages
+            "Demo response: I received '{}' with {} prior messages. This text is streamed token by token so the chat feels live.",
+            prompt, previous_messages
         ))
     }
 
