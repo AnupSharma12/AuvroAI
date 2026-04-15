@@ -1,6 +1,5 @@
 use reqwest::blocking::{Client, Response};
 use serde::Serialize;
-use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -191,92 +190,24 @@ fn read_streaming_response(
             continue;
         }
 
-        let Some(payload) = sse_data_payload(&buffer) else {
-            continue;
-        };
+        let line = std::str::from_utf8(&buffer)
+            .map_err(|err| format!("Stream read failed: {err}"))?
+            .to_owned();
 
-        if payload == b"[DONE]" {
+        if line.trim() == "data: [DONE]" {
             break;
         }
 
-        let delta = extract_chunk_text(payload)?;
+        let Some(delta) = crate::api::ai::extract_sse_delta_content(&line)? else {
+            continue;
+        };
+
         if !delta.is_empty() {
             output.push_str(&delta);
         }
     }
 
     Ok(output)
-}
-
-fn sse_data_payload(line: &[u8]) -> Option<&[u8]> {
-    if line.starts_with(b":") {
-        return None;
-    }
-
-    let payload = if let Some(payload) = line.strip_prefix(b"data:") {
-        trim_ascii_start(payload)
-    } else {
-        return None;
-    };
-
-    if payload.is_empty() {
-        None
-    } else {
-        Some(payload)
-    }
-}
-
-fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
-    while let Some((first, rest)) = bytes.split_first() {
-        if first.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
-    }
-
-    bytes
-}
-
-fn extract_chunk_text(payload: &[u8]) -> Result<String, String> {
-    let Some(first) = payload.first() else {
-        return Ok(String::new());
-    };
-    if *first != b'{' && *first != b'[' {
-        // Some providers send plain-text keepalive/status lines in SSE.
-        return Ok(String::new());
-    }
-
-    let json: Value = serde_json::from_slice(payload)
-        .map_err(|err| format!("Could not parse streaming chunk: {err}"))?;
-
-    if let Some(content) = json
-        .get("choices")
-        .and_then(|choices| choices.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
-        .and_then(|delta| delta.get("content"))
-        .and_then(|content| content.as_str())
-    {
-        return Ok(content.to_owned());
-    }
-
-    if let Some(content) = json
-        .get("choices")
-        .and_then(|choices| choices.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-    {
-        return Ok(content.to_owned());
-    }
-
-    if let Some(text) = json.get("text").and_then(|value| value.as_str()) {
-        return Ok(text.to_owned());
-    }
-
-    Ok(String::new())
 }
 
 fn chat_endpoint(endpoint: &str) -> String {

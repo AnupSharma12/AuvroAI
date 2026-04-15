@@ -58,6 +58,34 @@ fn extract_completion_text(body: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+pub fn extract_sse_delta_content(line: &str) -> Result<Option<String>, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with(':') {
+        return Ok(None);
+    }
+
+    let Some(payload) = trimmed.strip_prefix("data:") else {
+        return Ok(None);
+    };
+
+    let payload = payload.trim_start();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(None);
+    }
+
+    let json: Value = serde_json::from_str(payload)
+        .map_err(|err| format!("Could not parse streaming chunk: {err}"))?;
+
+    Ok(json
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .map(str::to_owned))
+}
+
 pub fn generate_title(first_user_message: &str) -> Result<String, String> {
     let api_key = crate::env::AUVRO_API_KEY.trim();
     let model = crate::env::AUVRO_MODEL.trim();

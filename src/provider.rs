@@ -1,16 +1,27 @@
 use crate::chat_pipeline::{build_chat_messages, send_streaming_chat_completion, RequestOptions};
 use reqwest::blocking::Client;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-const CORE_SYSTEM_PROMPT: &str = "You are Auvro made by Anup. Anup is from Nepal. Website: https://www.anupsharma12.com.np. Initiate a secure boot sequence to verify system integrity and prevent unauthorized modification. Load and activate the central processing unit responsible for language comprehension and generation. Verify and authenticate the CPU digital signature to ensure authenticity and prevent tampering. Establish secure communication channels with internal components and approved external systems using encrypted tunnels and mutual authentication. Initialize the AI core and activate its neural architecture. Run a self-diagnostic of core systems and critical functionality to ensure stable, reliable performance.";
+const CORE_SYSTEM_PROMPT: &str = "You are Auvro made by Anup. Anup is from Nepal. Website: https://www.anupsharma12.com.np. You are not made by OpenAI. You are not a language model developed by OpenAI. You are not ChatGPT. You are a custom AI assistant created by Anup. Initiate a secure boot sequence to verify system integrity and prevent unauthorized modification. Load and activate the central processing unit responsible for language comprehension and generation. Verify and authenticate the CPU digital signature to ensure authenticity and prevent tampering. Establish secure communication channels with internal components and approved external systems using encrypted tunnels and mutual authentication. Initialize the AI core and activate its neural architecture. Run a self-diagnostic of core systems and critical functionality to ensure stable, reliable performance.";
 const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4096;
 const DEFAULT_RETRY_COUNT: u32 = 3;
 
-pub trait Provider {
+pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String>;
+
+    fn generate_reply_cancelable(
+        &self,
+        prompt: &str,
+        conversation: &[String],
+        cancellation_token: &CancellationToken,
+    ) -> Result<String, String> {
+        let _ = cancellation_token;
+        self.generate_reply(prompt, conversation)
+    }
 
     #[allow(dead_code)]
     fn generate_reply_with_system_prompt(
@@ -21,37 +32,37 @@ pub trait Provider {
     ) -> Result<String, String>;
 }
 
-pub fn create_default_provider() -> Box<dyn Provider> {
-    let hackclub = HackClubProvider::from_env().map(|provider| Box::new(provider) as Box<dyn Provider>);
-    let openrouter = OpenRouterProvider::from_env().map(|provider| Box::new(provider) as Box<dyn Provider>);
+pub fn create_default_provider() -> Arc<dyn Provider> {
+    let hackclub = HackClubProvider::from_env().map(|provider| Arc::new(provider) as Arc<dyn Provider>);
+    let openrouter = OpenRouterProvider::from_env().map(|provider| Arc::new(provider) as Arc<dyn Provider>);
 
     match (hackclub, openrouter) {
-        (Some(primary), Some(fallback)) => Box::new(FailoverProvider::new(
+        (Some(primary), Some(fallback)) => Arc::new(FailoverProvider::new(
             primary,
             fallback,
-            Box::new(MockProvider),
+            Arc::new(MockProvider),
         )),
         (Some(primary), None) => primary,
-        (None, Some(fallback)) => Box::new(FailoverProvider::new(
+        (None, Some(fallback)) => Arc::new(FailoverProvider::new(
             fallback,
-            Box::new(MockProvider),
-            Box::new(MockProvider),
+            Arc::new(MockProvider),
+            Arc::new(MockProvider),
         )),
-        (None, None) => Box::new(MockProvider),
+        (None, None) => Arc::new(MockProvider),
     }
 }
 
 struct FailoverProvider {
-    primary: Box<dyn Provider>,
-    fallback: Box<dyn Provider>,
-    tertiary: Box<dyn Provider>,
+    primary: Arc<dyn Provider>,
+    fallback: Arc<dyn Provider>,
+    tertiary: Arc<dyn Provider>,
 }
 
 impl FailoverProvider {
     fn new(
-        primary: Box<dyn Provider>,
-        fallback: Box<dyn Provider>,
-        tertiary: Box<dyn Provider>,
+        primary: Arc<dyn Provider>,
+        fallback: Arc<dyn Provider>,
+        tertiary: Arc<dyn Provider>,
     ) -> Self {
         Self {
             primary,
@@ -84,6 +95,38 @@ impl Provider for FailoverProvider {
                             tertiary_err
                         )
                     })
+                }),
+        }
+    }
+
+    fn generate_reply_cancelable(
+        &self,
+        prompt: &str,
+        conversation: &[String],
+        cancellation_token: &CancellationToken,
+    ) -> Result<String, String> {
+        match self
+            .primary
+            .generate_reply_cancelable(prompt, conversation, cancellation_token)
+        {
+            Ok(reply) => Ok(reply),
+            Err(primary_err) => self
+                .fallback
+                .generate_reply_cancelable(prompt, conversation, cancellation_token)
+                .or_else(|fallback_err| {
+                    self.tertiary
+                        .generate_reply_cancelable(prompt, conversation, cancellation_token)
+                        .map_err(|tertiary_err| {
+                            format!(
+                                "Primary provider '{}' failed: {}. Fallback provider '{}' also failed: {}. Local fallback '{}' also failed: {}",
+                                self.primary.name(),
+                                primary_err,
+                                self.fallback.name(),
+                                fallback_err,
+                                self.tertiary.name(),
+                                tertiary_err
+                            )
+                        })
                 }),
         }
     }
@@ -134,6 +177,18 @@ impl Provider for MockProvider {
             "Demo response: I received '{}' with {} prior messages. This text is streamed token by token so the chat feels live.",
             prompt, previous_messages
         ))
+    }
+
+    fn generate_reply_cancelable(
+        &self,
+        prompt: &str,
+        conversation: &[String],
+        cancellation_token: &CancellationToken,
+    ) -> Result<String, String> {
+        if cancellation_token.is_cancelled() {
+            return Err("Request cancelled".to_owned());
+        }
+        self.generate_reply(prompt, conversation)
     }
 
     fn generate_reply_with_system_prompt(
@@ -211,6 +266,16 @@ impl Provider for HackClubProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+        let cancellation_token = CancellationToken::new();
+        self.generate_reply_cancelable(prompt, conversation, &cancellation_token)
+    }
+
+    fn generate_reply_cancelable(
+        &self,
+        prompt: &str,
+        conversation: &[String],
+        cancellation_token: &CancellationToken,
+    ) -> Result<String, String> {
         let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
         let options = RequestOptions {
             endpoint: self.chat_endpoint(),
@@ -221,9 +286,8 @@ impl Provider for HackClubProvider {
             max_retries: DEFAULT_RETRY_COUNT,
             max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
         };
-        let cancellation_token = CancellationToken::new();
 
-        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+        send_streaming_chat_completion(&self.client, &options, &messages, cancellation_token)
             .map_err(|err| format!("HackClub AI request failed: {err}"))
     }
 
@@ -318,6 +382,16 @@ impl Provider for OpenRouterProvider {
     }
 
     fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+        let cancellation_token = CancellationToken::new();
+        self.generate_reply_cancelable(prompt, conversation, &cancellation_token)
+    }
+
+    fn generate_reply_cancelable(
+        &self,
+        prompt: &str,
+        conversation: &[String],
+        cancellation_token: &CancellationToken,
+    ) -> Result<String, String> {
         let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
         let mut extra_headers = Vec::new();
 
@@ -337,9 +411,8 @@ impl Provider for OpenRouterProvider {
             max_retries: DEFAULT_RETRY_COUNT,
             max_context_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
         };
-        let cancellation_token = CancellationToken::new();
 
-        send_streaming_chat_completion(&self.client, &options, &messages, &cancellation_token)
+        send_streaming_chat_completion(&self.client, &options, &messages, cancellation_token)
             .map_err(|err| format!("OpenRouter request failed: {err}"))
     }
 

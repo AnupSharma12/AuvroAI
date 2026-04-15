@@ -9,11 +9,13 @@ mod ui;
 use api::conversations::{self, Conversation, Message};
 use api::profile::{self, Profile};
 use eframe::egui;
+use egui_commonmark::CommonMarkCache;
 use cache::model_metadata::ModelMetadataCache;
 use provider::{create_default_provider, Provider};
 use secrets::SecretStore;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -113,7 +115,7 @@ struct PendingTitleGeneration {
 }
 
 pub(crate) struct AuvroApp {
-    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) provider: Arc<dyn Provider>,
     pub(crate) draft_message: String,
     pub(crate) conversations: Vec<Conversation>,
     pub(crate) active_conversation_id: Option<Uuid>,
@@ -152,15 +154,20 @@ pub(crate) struct AuvroApp {
     pub(crate) avatar_texture: Option<egui::TextureHandle>,
     #[allow(dead_code)]
     pub(crate) model_cache: ModelMetadataCache,
+    pub(crate) markdown_cache: CommonMarkCache,
     pub(crate) is_loading: bool,
     pub(crate) profile_loading: bool,
     pub(crate) profile_menu_anchor: Option<egui::Pos2>,
     pub(crate) error_message: Option<String>,
-    pub(crate) pending_response: Option<Vec<char>>,
+    pub(crate) pending_response: Option<String>,
+    pub(crate) streaming_buffer: String,
     pub(crate) streamed_chars: usize,
     pub(crate) stream_conversation_id: Option<Uuid>,
     pub(crate) stream_line_index: Option<usize>,
+    pub(crate) pending_prompt_after_create: Option<String>,
     pub(crate) last_stream_tick: Instant,
+    provider_response_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    stream_cancellation_token: Option<CancellationToken>,
     pending_title_generation: Option<PendingTitleGeneration>,
     supabase_runtime: Arc<tokio::runtime::Runtime>,
     supabase_events_tx: mpsc::Sender<SupabaseEvent>,
@@ -263,15 +270,20 @@ impl Default for AuvroApp {
             profile: None,
             avatar_texture: None,
             model_cache: ModelMetadataCache::new(Duration::from_secs(600)),
+            markdown_cache: CommonMarkCache::default(),
             is_loading: false,
             profile_loading: false,
             profile_menu_anchor: None,
             error_message: None,
             pending_response: None,
+            streaming_buffer: String::new(),
             streamed_chars: 0,
             stream_conversation_id: None,
             stream_line_index: None,
+            pending_prompt_after_create: None,
             last_stream_tick: Instant::now(),
+            provider_response_rx: None,
+            stream_cancellation_token: None,
             pending_title_generation: None,
             supabase_runtime,
             supabase_events_tx,
@@ -846,10 +858,15 @@ impl AuvroApp {
                         self.messages.clear();
                         self.messages_loading = false;
                         self.creating_new_chat = false;
+
+                        if let Some(prompt) = self.pending_prompt_after_create.take() {
+                            self.send_prompt_to_conversation(conversation.id, prompt);
+                        }
                     }
                     Err(err) => {
                         self.creating_new_chat = false;
                         self.messages_loading = false;
+                        self.pending_prompt_after_create = None;
                         self.error_message = Some(err);
                     }
                 },
@@ -1495,6 +1512,16 @@ impl AuvroApp {
             .collect()
     }
 
+    fn normalize_ai_text(text: &str) -> String {
+        text.chars()
+            .map(|ch| match ch {
+                '\u{00A0}' | '\u{2007}' | '\u{202F}' => ' ',
+                '\u{2060}' | '\u{FEFF}' => ' ',
+                _ => ch,
+            })
+            .collect()
+    }
+
     pub(crate) fn sidebar_title(title: &str) -> String {
         const MAX_CHARS: usize = 28;
         if title.chars().count() <= MAX_CHARS {
@@ -1505,6 +1532,23 @@ impl AuvroApp {
     }
 
     fn apply_app_theme(&self, ctx: &egui::Context) {
+        let emoji_fonts_id = egui::Id::new("emoji_fonts_loaded");
+        let emoji_fonts_loaded = ctx.data(|data| data.get_temp::<bool>(emoji_fonts_id).unwrap_or(false));
+        if !emoji_fonts_loaded {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "noto_color_emoji".to_owned(),
+                egui::FontData::from_static(include_bytes!("../assets/NotoColorEmoji-Regular.ttf")).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("noto_color_emoji".to_owned());
+            ctx.set_fonts(fonts);
+            ctx.data_mut(|data| data.insert_temp(emoji_fonts_id, true));
+        }
+
         let dark_mode = match self.theme_preference {
             ThemePreference::Dark => true,
             ThemePreference::Light => false,
@@ -1608,9 +1652,20 @@ impl AuvroApp {
         self.error_message = None;
 
         let Some(conversation_id) = self.active_conversation_id else {
-            self.error_message = Some("Create or select a conversation first.".to_owned());
+            self.pending_prompt_after_create = Some(prompt);
+            if !self.creating_new_chat {
+                self.start_new_chat();
+            }
             return;
         };
+
+        self.send_prompt_to_conversation(conversation_id, prompt);
+    }
+
+    fn send_prompt_to_conversation(&mut self, conversation_id: Uuid, prompt: String) {
+        if self.is_loading {
+            return;
+        }
 
         self.messages.push(Message {
             id: Uuid::new_v4(),
@@ -1619,6 +1674,7 @@ impl AuvroApp {
             content: prompt.clone(),
             created_at: chrono::Utc::now(),
         });
+
         let should_generate_title = self.messages.len() == 1
             && self
                 .conversations
@@ -1635,15 +1691,6 @@ impl AuvroApp {
         self.request_append_message(conversation_id, "user", prompt.clone());
         self.request_bump_conversation_updated_at(conversation_id);
 
-        let conversation = Self::as_conversation_lines(&self.messages);
-        let full_response = match self.provider.generate_reply(&prompt, &conversation) {
-            Ok(reply) => reply,
-            Err(err) => {
-                self.error_message = Some(format!("Provider error: {err}"));
-                return;
-            }
-        };
-
         self.messages.push(Message {
             id: Uuid::new_v4(),
             conversation_id,
@@ -1652,11 +1699,70 @@ impl AuvroApp {
             created_at: chrono::Utc::now(),
         });
 
-        self.pending_response = Some(full_response.chars().collect());
+        let conversation = Self::as_conversation_lines(&self.messages);
+        let provider = Arc::clone(&self.provider);
+        let prompt_for_task = prompt;
+        let conversation_for_task = conversation;
+        let cancellation_token = CancellationToken::new();
+        let task_cancellation_token = cancellation_token.clone();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = provider.generate_reply_cancelable(
+                &prompt_for_task,
+                &conversation_for_task,
+                &task_cancellation_token,
+            );
+            let _ = tx.send(result);
+        });
+
+        self.provider_response_rx = Some(rx);
+        self.stream_cancellation_token = Some(cancellation_token);
+        self.pending_response = None;
+        self.streaming_buffer.clear();
         self.streamed_chars = 0;
         self.stream_conversation_id = Some(conversation_id);
         self.stream_line_index = Some(self.messages.len().saturating_sub(1));
         self.is_loading = true;
+        self.last_stream_tick = Instant::now();
+    }
+
+    pub(crate) fn stop_streaming(&mut self) {
+        if let Some(cancellation_token) = self.stream_cancellation_token.take() {
+            cancellation_token.cancel();
+        }
+
+        let conversation_id = self.stream_conversation_id;
+        let partial = self.streaming_buffer.trim().to_owned();
+
+        if let Some(line_idx) = self.stream_line_index {
+            if partial.is_empty() {
+                if self
+                    .messages
+                    .get(line_idx)
+                    .is_some_and(|message| message.role == "assistant" && message.content.trim().is_empty())
+                {
+                    self.messages.remove(line_idx);
+                }
+            } else if let Some(message) = self.messages.get_mut(line_idx) {
+                message.content = partial.clone();
+            }
+        }
+
+        if !partial.is_empty() {
+            if let Some(conversation_id) = conversation_id {
+                self.request_append_message(conversation_id, "assistant", partial);
+                self.request_bump_conversation_updated_at(conversation_id);
+            }
+        }
+
+        self.is_loading = false;
+        self.provider_response_rx = None;
+        self.pending_response = None;
+        self.streaming_buffer.clear();
+        self.streamed_chars = 0;
+        self.stream_conversation_id = None;
+        self.stream_line_index = None;
         self.last_stream_tick = Instant::now();
     }
 
@@ -1667,29 +1773,87 @@ impl AuvroApp {
 
         ctx.request_repaint_after(Duration::from_millis(16));
 
+        if self.pending_response.is_none() {
+            if let Some(rx) = &self.provider_response_rx {
+                match rx.try_recv() {
+                    Ok(Ok(full_response)) => {
+                        self.pending_response = Some(Self::normalize_ai_text(&full_response));
+                        self.provider_response_rx = None;
+                        self.stream_cancellation_token = None;
+                        self.last_stream_tick = Instant::now();
+                    }
+                    Ok(Err(err)) => {
+                        if let Some(line_idx) = self.stream_line_index {
+                            if self
+                                .messages
+                                .get(line_idx)
+                                .is_some_and(|message| message.role == "assistant" && message.content.trim().is_empty())
+                            {
+                                self.messages.remove(line_idx);
+                            }
+                        }
+
+                        self.is_loading = false;
+                        self.provider_response_rx = None;
+                        self.stream_cancellation_token = None;
+                        self.pending_response = None;
+                        self.streaming_buffer.clear();
+                        self.streamed_chars = 0;
+                        self.stream_conversation_id = None;
+                        self.stream_line_index = None;
+
+                        if !err.to_ascii_lowercase().contains("cancelled") {
+                            self.error_message = Some(format!("Provider error: {err}"));
+                        }
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.is_loading = false;
+                        self.provider_response_rx = None;
+                        self.stream_cancellation_token = None;
+                        self.pending_response = None;
+                        self.streaming_buffer.clear();
+                        self.streamed_chars = 0;
+                        self.stream_conversation_id = None;
+                        self.stream_line_index = None;
+                        self.error_message = Some("Provider task disconnected unexpectedly.".to_owned());
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.last_stream_tick.elapsed() < Duration::from_millis(24) {
             return;
         }
         self.last_stream_tick = Instant::now();
 
-        let Some(chars) = self.pending_response.as_ref() else {
+        let Some(response) = self.pending_response.as_ref() else {
             self.is_loading = false;
             return;
         };
 
-        let chars_len = chars.len();
-        self.streamed_chars = (self.streamed_chars + 3).min(chars_len);
-        let streamed_text: String = chars.iter().take(self.streamed_chars).collect();
+        let chars_len = response.chars().count();
+        let next_chunk: String = response
+            .chars()
+            .skip(self.streamed_chars)
+            .take(3)
+            .collect();
+        self.streamed_chars = (self.streamed_chars + next_chunk.chars().count()).min(chars_len);
+        self.streaming_buffer.push_str(&next_chunk);
 
         if let Some(line_idx) = self.stream_line_index {
             if let Some(message) = self.messages.get_mut(line_idx) {
-                message.content = streamed_text;
+                message.content = self.streaming_buffer.clone();
             }
         }
 
         if self.streamed_chars >= chars_len {
             self.is_loading = false;
             self.pending_response = None;
+            self.provider_response_rx = None;
+            self.stream_cancellation_token = None;
 
             if let (Some(conversation_id), Some(line_idx)) =
                 (self.stream_conversation_id.take(), self.stream_line_index.take())
@@ -1731,13 +1895,17 @@ impl eframe::App for AuvroApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("AuvroAI").strong().size(18.0));
-                        ui.label(
-                            egui::RichText::new("Minimal, centered chat workspace")
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                    ui.horizontal(|ui| {
+                        ui::render_app_logo(ui, 32.0);
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("AuvroAI").strong().size(18.0));
+                            ui.label(
+                                egui::RichText::new("Minimal, centered chat workspace")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1791,7 +1959,8 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 680.0])
-            .with_min_inner_size([360.0, 500.0]),
+            .with_min_inner_size([360.0, 500.0])
+            .with_icon(load_app_icon()),
         ..Default::default()
     };
 
@@ -1813,4 +1982,17 @@ fn load_environment() -> bool {
     }
 
     dotenvy::dotenv().is_ok()
+}
+
+fn load_app_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../assets/icons/Auvro.png"))
+        .expect("Failed to decode Auvro.png for app icon")
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }

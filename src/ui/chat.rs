@@ -1,14 +1,7 @@
 use eframe::egui;
+use egui_commonmark::CommonMarkViewer;
 
 const CHAT_MAX_WIDTH: f32 = 800.0;
-
-enum MessageBlock {
-    Paragraph(String),
-    Code {
-        language: Option<String>,
-        code: String,
-    },
-}
 
 fn render_chat_avatar_button(app: &mut crate::AppState, ui: &mut egui::Ui) {
     let initials = app.profile_initials();
@@ -51,11 +44,9 @@ fn render_avatar_menu(app: &mut crate::AppState, ctx: &egui::Context) {
 fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(52.0);
-        ui.label(
-            egui::RichText::new("AuvroAI")
-                .size(24.0)
-                .strong(),
-        );
+        crate::ui::render_app_logo(ui, 72.0);
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("AuvroAI").size(24.0).strong());
         ui.label(
             egui::RichText::new("A calm, centered workspace for focused chat")
                 .small()
@@ -102,120 +93,23 @@ fn render_empty_state(app: &mut crate::AppState, ui: &mut egui::Ui) {
     });
 }
 
-fn split_message_blocks(content: &str) -> Vec<MessageBlock> {
-    let mut blocks = Vec::new();
-    let mut text_buffer = String::new();
-    let mut code_buffer = String::new();
-    let mut in_code_block = false;
-    let mut code_language: Option<String> = None;
-
-    for line in content.lines() {
-        let fence = line.trim_start();
-        if fence.starts_with("```") {
-            if in_code_block {
-                blocks.push(MessageBlock::Code {
-                    language: code_language.take(),
-                    code: code_buffer.trim_end().to_owned(),
-                });
-                code_buffer.clear();
-                in_code_block = false;
-            } else {
-                if !text_buffer.trim().is_empty() {
-                    blocks.push(MessageBlock::Paragraph(text_buffer.trim().to_owned()));
-                    text_buffer.clear();
-                }
-
-                let language = fence.trim_start_matches("```").trim();
-                code_language = if language.is_empty() {
-                    None
-                } else {
-                    Some(language.to_owned())
-                };
-                in_code_block = true;
-            }
-            continue;
-        }
-
-        if in_code_block {
-            code_buffer.push_str(line);
-            code_buffer.push('\n');
-        } else {
-            text_buffer.push_str(line);
-            text_buffer.push('\n');
-        }
-    }
-
-    if in_code_block {
-        blocks.push(MessageBlock::Code {
-            language: code_language,
-            code: code_buffer.trim_end().to_owned(),
-        });
-    } else if !text_buffer.trim().is_empty() {
-        blocks.push(MessageBlock::Paragraph(text_buffer.trim().to_owned()));
-    }
-
-    if blocks.is_empty() {
-        blocks.push(MessageBlock::Paragraph(content.to_owned()));
-    }
-
-    blocks
-}
-
-fn render_paragraph(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    for (index, paragraph) in text.split("\n\n").enumerate() {
-        if index > 0 {
-            ui.add_space(8.0);
-        }
-
-        ui.add(
-            egui::Label::new(egui::RichText::new(paragraph).size(15.0).color(color))
-                .wrap(),
-        );
-    }
-}
-
-fn render_code_block(ui: &mut egui::Ui, language: Option<&str>, code: &str) {
-    let label = language.unwrap_or("code");
-    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
-
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgba_premultiplied(17, 21, 28, 235))
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(label.to_ascii_uppercase())
-                        .small()
-                        .strong()
-                        .color(ui.visuals().weak_text_color()),
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("Copy").frame(false)).clicked() {
-                        ui.ctx().copy_text(code.to_owned());
-                    }
-                });
-            });
-
-            ui.add_space(8.0);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(code)
-                        .monospace()
-                        .size(14.0)
-                        .color(egui::Color32::from_rgb(226, 231, 238)),
-                )
-                .wrap(),
-            );
-        });
-}
-
-fn render_message_row(app: &crate::AppState, ui: &mut egui::Ui, message: &crate::api::conversations::Message) {
+fn render_message_row(
+    app: &mut crate::AppState,
+    ui: &mut egui::Ui,
+    message: &crate::api::conversations::Message,
+    message_index: usize,
+) {
     let is_user = message.role == "user";
-    let blocks = split_message_blocks(&message.content);
-    let max_width = if is_user { 650.0 } else { 720.0 };
+    let available_width = ui.available_width();
+    let max_width = if is_user {
+        (available_width - 20.0).clamp(180.0, 650.0)
+    } else {
+        (available_width - 20.0).clamp(180.0, 720.0)
+    };
+    let is_live_stream = !is_user
+        && app.is_loading
+        && app.stream_line_index == Some(message_index)
+        && !app.streaming_buffer.is_empty();
 
     ui.with_layout(
         if is_user {
@@ -229,13 +123,17 @@ fn render_message_row(app: &crate::AppState, ui: &mut egui::Ui, message: &crate:
             let fill = egui::Color32::from_rgb(255, 255, 255);
             let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 223, 228));
 
-            egui::Frame::new()
+            let frame_response = egui::Frame::new()
                 .fill(fill)
                 .stroke(stroke)
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 12))
                 .show(ui, |ui| {
-                    ui.set_width(max_width);
+                    if is_user {
+                        ui.set_width(max_width);
+                    } else {
+                        ui.set_max_width(max_width);
+                    }
 
                     ui.horizontal(|ui| {
                         let label = if is_user { "You" } else { "Auvro" };
@@ -259,23 +157,56 @@ fn render_message_row(app: &crate::AppState, ui: &mut egui::Ui, message: &crate:
 
                     ui.add_space(8.0);
 
-                    for block in blocks {
-                        match block {
-                            MessageBlock::Paragraph(text) => {
-                                render_paragraph(
-                                    ui,
-                                    &text,
-                                    egui::Color32::from_rgb(0, 0, 0),
-                                );
-                            }
-                            MessageBlock::Code { language, code } => {
-                                render_code_block(ui, language.as_deref(), &code);
-                            }
-                        }
-
-                        ui.add_space(10.0);
+                    if is_user {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&message.content)
+                                    .size(15.0)
+                                    .color(egui::Color32::from_rgb(0, 0, 0)),
+                            )
+                            .wrap(),
+                        );
+                    } else if is_live_stream {
+                        let streaming_content = app
+                            .streaming_buffer
+                            .replace('\u{202F}', " ")
+                            .replace('\u{00A0}', " ");
+                        CommonMarkViewer::new().show(
+                            ui,
+                            &mut app.markdown_cache,
+                            &streaming_content,
+                        );
+                    } else {
+                        let assistant_content = message
+                            .content
+                            .replace('\u{202F}', " ")
+                            .replace('\u{00A0}', " ");
+                        CommonMarkViewer::new().show(
+                            ui,
+                            &mut app.markdown_cache,
+                            &assistant_content,
+                        );
                     }
                 });
+
+            if !is_user {
+                let message_rect = frame_response.response.rect;
+                let copy_rect = egui::Rect::from_min_size(
+                    egui::pos2(message_rect.right() - 42.0, message_rect.bottom() - 30.0),
+                    egui::vec2(36.0, 22.0),
+                );
+
+                if ui
+                    .put(
+                        copy_rect,
+                        egui::Button::new(egui::RichText::new("📋").size(13.0))
+                            .corner_radius(egui::CornerRadius::same(4)),
+                    )
+                    .clicked()
+                {
+                    ui.ctx().copy_text(message.content.clone());
+                }
+            }
         },
     );
 
@@ -340,8 +271,8 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
         return;
     };
 
-    let content_width = ui.available_width().min(CHAT_MAX_WIDTH);
-    let message_list_height = (ui.available_height() - 170.0).max(240.0);
+    let content_width = ui.available_width().clamp(200.0, CHAT_MAX_WIDTH);
+    let message_list_height = (ui.available_height() - 150.0).max(96.0);
 
     ui.vertical_centered(|ui| {
         ui.set_max_width(CHAT_MAX_WIDTH);
@@ -378,8 +309,14 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
                     ui.add_space(20.0);
                 }
 
-                for message in &app.messages {
-                    render_message_row(app, ui, message);
+                let messages_snapshot = app.messages.clone();
+                for (message_index, message) in messages_snapshot.iter().enumerate() {
+                    render_message_row(
+                        app,
+                        ui,
+                        message,
+                        message_index,
+                    );
                 }
             });
 
@@ -408,58 +345,92 @@ pub(crate) fn render_chat_panel(app: &mut crate::AppState, ui: &mut egui::Ui) {
 
         ui.add_space(12.0);
 
-        let draft_lines = app.draft_message.lines().count().clamp(1, 6) as f32;
-        let composer_height = 42.0 + (draft_lines - 1.0) * 18.0;
+        let draft_lines = app.draft_message.lines().count().clamp(1, 4) as f32;
+        let composer_height = 52.0 + (draft_lines - 1.0) * 16.0;
         let can_send = !app.is_loading
             && !app.messages_loading
             && app.auth_error.is_none()
-            && !crate::env::SUPABASE_PUBLISHABLE_KEY.trim().is_empty()
-            && app.active_conversation_id.is_some();
+            && !crate::env::SUPABASE_PUBLISHABLE_KEY.trim().is_empty();
 
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(255, 255, 255))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(223, 227, 233),
-            ))
-            .corner_radius(egui::CornerRadius::same(18))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(content_width);
+        let available_rect = ui.available_rect_before_wrap();
+        let composer_width = (available_rect.width() - 24.0).clamp(180.0, 720.0);
+        let composer_x = available_rect.left() + ((available_rect.width() - composer_width) * 0.5);
+        let composer_y = ui.cursor().min.y;
+        let composer_rect = egui::Rect::from_min_size(
+            egui::pos2(composer_x, composer_y),
+            egui::vec2(composer_width, composer_height),
+        );
 
-                ui.horizontal(|ui| {
-                    let editor_width = (ui.available_width() - 84.0).max(220.0);
-                    let editor = ui.add_sized(
-                        [editor_width, composer_height],
-                        egui::TextEdit::multiline(&mut app.draft_message)
-                            .desired_rows(2)
-                            .frame(false)
-                            .hint_text("Message AuvroAI...")
-                            .id_salt("composer_input"),
-                    );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(composer_rect), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(255, 255, 255))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(223, 227, 233),
+                ))
+                .corner_radius(egui::CornerRadius::same(18))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    let button_width = 72.0;
+                    let gap = 8.0;
+                    let button_group_width = button_width;
+                    let editor_width = (composer_width - button_group_width - gap - 24.0).max(96.0);
 
-                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let shift_held = ui.input(|i| i.modifiers.shift);
-                    if editor.has_focus() && enter_pressed && !shift_held && can_send {
-                        app.draft_message = app.draft_message.trim_end_matches('\n').to_owned();
-                        app.send_message();
-                    }
+                    ui.horizontal(|ui| {
+                        let text_response = ui.add_sized(
+                            [editor_width, composer_height - 24.0],
+                            egui::TextEdit::multiline(&mut app.draft_message)
+                                .desired_rows(1)
+                                .desired_width(composer_width - 88.0)
+                                .hint_text("Message AuvroAI...")
+                                .frame(true)
+                                .id_salt("composer_input"),
+                        );
 
-                    ui.add_space(10.0);
+                        let shift_held = ui.input(|i| i.modifiers.shift);
+                        let submitted = text_response.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && !shift_held;
+                        if submitted {
+                            app.draft_message = app.draft_message.trim_end_matches('\n').to_owned();
+                            app.send_message();
+                        }
 
-                    let send_clicked = ui
-                        .add_enabled(
-                            can_send,
-                            egui::Button::new(
-                                egui::RichText::new("Send").strong(),
-                            ),
-                        )
-                        .clicked();
-                    if send_clicked {
-                        app.send_message();
-                    }
+                        ui.add_space(gap);
+
+                        if app.is_loading {
+                            let stop_clicked = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Stop").color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(180, 30, 30))
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .min_size(egui::vec2(72.0, 40.0)),
+                                )
+                                .clicked();
+
+                            if stop_clicked {
+                                app.stop_streaming();
+                            }
+                        } else {
+                            let send_clicked = ui
+                                .add_enabled(
+                                    can_send,
+                                    egui::Button::new(egui::RichText::new("Send").strong())
+                                        .min_size(egui::vec2(72.0, 40.0)),
+                                )
+                                .clicked();
+
+                            if send_clicked {
+                                app.send_message();
+                            }
+                        }
+                    });
                 });
-            });
+        });
+
+        ui.add_space(composer_height + 8.0);
     });
 
     render_avatar_menu(app, ui.ctx());

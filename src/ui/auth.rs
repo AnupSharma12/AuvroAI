@@ -19,7 +19,7 @@ fn text_field(
     id_source: &'static str,
     width: f32,
     label_color: egui::Color32,
-) -> bool {
+) -> egui::Response {
     ui.label(egui::RichText::new(label).small().color(label_color));
     ui.add_sized(
         [width, 40.0],
@@ -27,7 +27,6 @@ fn text_field(
             .hint_text(hint)
             .id_salt(id_source),
     )
-    .changed()
 }
 
 fn password_field(
@@ -39,10 +38,11 @@ fn password_field(
     width: f32,
     show_password: &mut bool,
     label_color: egui::Color32,
-) -> bool {
+) -> (bool, egui::Response) {
     ui.label(egui::RichText::new(label).small().color(label_color));
 
     let mut changed = false;
+    let mut input_response = None;
     ui.horizontal(|ui| {
         let input_w = (width - 84.0).max(140.0);
         let response = ui.add_sized(
@@ -53,6 +53,7 @@ fn password_field(
                 .id_salt(id_source),
         );
         changed |= response.changed();
+            input_response = Some(response);
 
         if ui
             .add_sized(
@@ -65,7 +66,10 @@ fn password_field(
         }
     });
 
-    changed
+    (
+        changed,
+        input_response.expect("password input response should always be present"),
+    )
 }
 
 fn notice_box(ui: &mut egui::Ui, text: &str, is_error: bool, width: f32) {
@@ -133,6 +137,10 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                         ui.set_max_width(content_width);
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
+                        ui.vertical_centered(|ui| {
+                            crate::ui::render_app_logo(ui, 64.0);
+                        });
+
                         let weak_text = ui.visuals().weak_text_color();
                         let label_color = egui::Color32::from_rgb(115, 115, 115);
 
@@ -165,11 +173,12 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                                 "auth_display_name",
                                 content_width,
                                 label_color,
-                            );
+                            )
+                            .changed();
                             ui.add_space(10.0);
                         }
 
-                        edited |= text_field(
+                        let email_response = text_field(
                             ui,
                             "Email",
                             &mut app.auth_email,
@@ -178,9 +187,12 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                             content_width,
                             label_color,
                         );
+                        edited |= email_response.changed();
+                        let focus_password = email_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.add_space(10.0);
 
-                        edited |= password_field(
+                        let (password_changed, password_response) = password_field(
                             ui,
                             "Password",
                             &mut app.auth_password,
@@ -190,6 +202,14 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                             &mut show_password,
                             label_color,
                         );
+                        edited |= password_changed;
+
+                        if focus_password {
+                            password_response.request_focus();
+                        }
+
+                        let password_submit = password_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                         if app.auth_mode == crate::AuthMode::SignUp {
                             ui.add_space(10.0);
@@ -226,20 +246,21 @@ pub(crate) fn render(app: &mut crate::AppState, ui: &mut egui::Ui) {
                             "Create Account"
                         };
 
-                        if ui
+                        let action_clicked = ui
                             .add_sized(
                                 [content_width, 40.0],
                                 egui::Button::new(
                                     egui::RichText::new(action_label)
-                                        .color(egui::Color32::WHITE)
+                                        .color(egui::Color32::from_rgb(255, 255, 255))
                                         .strong(),
                                 )
                                 .fill(egui::Color32::from_rgb(135, 206, 235))
                                 .stroke(egui::Stroke::NONE)
                                 .corner_radius(egui::CornerRadius::same(8)),
                             )
-                            .clicked()
-                        {
+                            .clicked();
+
+                        if action_clicked || password_submit {
                             match app.auth_mode {
                                 crate::AuthMode::Login => {
                                     if auth_ready {
