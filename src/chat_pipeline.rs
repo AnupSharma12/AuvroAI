@@ -96,6 +96,23 @@ pub fn send_streaming_chat_completion(
     messages: &[ApiMessage],
     cancellation_token: &CancellationToken,
 ) -> Result<String, String> {
+    let prompt = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let system_prompt = messages
+        .iter()
+        .find(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let cache_key = crate::cache::response_cache::make_cache_key(prompt, &options.model, system_prompt);
+
+    if let Some(cached) = crate::cache::response_cache::get_cached_response(&cache_key) {
+        return Ok(cached);
+    }
+
     let mut last_error: Option<String> = None;
 
     for attempt in 0..=options.max_retries {
@@ -104,7 +121,10 @@ pub fn send_streaming_chat_completion(
         }
 
         match send_once(client, options, messages, cancellation_token) {
-            Ok(reply) => return Ok(reply),
+            Ok(reply) => {
+                crate::cache::response_cache::insert_cached_response(cache_key.clone(), reply.clone());
+                return Ok(reply);
+            }
             Err(err) => {
                 last_error = Some(err.clone());
                 if attempt >= options.max_retries || !is_transient_error(&err) {
