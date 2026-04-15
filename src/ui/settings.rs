@@ -12,6 +12,10 @@ fn render_status(ui: &mut egui::Ui, status: &Option<crate::SettingsStatus>) {
 }
 
 pub(crate) fn render_settings_screen(app: &mut crate::AppState, ui: &mut egui::Ui) {
+    let _ = app
+        .model_cache
+        .ensure_loaded(crate::env::OPENROUTER_API_KEY);
+
     let initials = app.profile_initials();
     let profile_display_name = app
         .profile
@@ -173,6 +177,30 @@ pub(crate) fn render_settings_screen(app: &mut crate::AppState, ui: &mut egui::U
                 app.save_theme_preference();
             }
             render_status(ui, &app.settings_theme_status);
+        });
+
+        ui.add_space(12.0);
+        ui.group(|ui| {
+            ui.heading("Model metadata");
+            ui.add_space(8.0);
+
+            match app.model_cache.state_snapshot() {
+                crate::cache::model_metadata::CacheState::Empty => {
+                    ui.label("Metadata not loaded yet.");
+                }
+                crate::cache::model_metadata::CacheState::Loading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Fetching model metadata...");
+                    });
+                }
+                crate::cache::model_metadata::CacheState::Loaded { models, .. } => {
+                    ui.label(format!("Loaded {} models.", models.len()));
+                }
+                crate::cache::model_metadata::CacheState::Failed(message) => {
+                    ui.colored_label(egui::Color32::from_rgb(255, 99, 99), message);
+                }
+            }
         });
 
         ui.add_space(12.0);
