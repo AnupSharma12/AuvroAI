@@ -160,7 +160,6 @@ pub(crate) struct AuvroApp {
     pub(crate) profile_menu_anchor: Option<egui::Pos2>,
     pub(crate) error_message: Option<String>,
     pub(crate) pending_response: Option<String>,
-    pub(crate) streaming_buffer: String,
     pub(crate) streamed_chars: usize,
     pub(crate) stream_conversation_id: Option<Uuid>,
     pub(crate) stream_line_index: Option<usize>,
@@ -276,7 +275,6 @@ impl Default for AuvroApp {
             profile_menu_anchor: None,
             error_message: None,
             pending_response: None,
-            streaming_buffer: String::new(),
             streamed_chars: 0,
             stream_conversation_id: None,
             stream_line_index: None,
@@ -1499,14 +1497,14 @@ impl AuvroApp {
         self.auth_notice = Some("Logged out.".to_owned());
     }
 
-    fn as_conversation_lines(messages: &[Message]) -> Vec<String> {
+    fn as_conversation_lines(messages: &[Message]) -> Vec<Arc<str>> {
         messages
             .iter()
             .map(|m| {
                 if m.role == "user" {
-                    format!("You: {}", m.content)
+                    Arc::from(format!("You: {}", m.content))
                 } else {
-                    format!("Auvro: {}", m.content)
+                    Arc::from(format!("Auvro: {}", m.content))
                 }
             })
             .collect()
@@ -1719,7 +1717,6 @@ impl AuvroApp {
         self.provider_response_rx = Some(rx);
         self.stream_cancellation_token = Some(cancellation_token);
         self.pending_response = None;
-        self.streaming_buffer.clear();
         self.streamed_chars = 0;
         self.stream_conversation_id = Some(conversation_id);
         self.stream_line_index = Some(self.messages.len().saturating_sub(1));
@@ -1733,7 +1730,11 @@ impl AuvroApp {
         }
 
         let conversation_id = self.stream_conversation_id;
-        let partial = self.streaming_buffer.trim().to_owned();
+        let partial = self
+            .stream_line_index
+            .and_then(|line_idx| self.messages.get(line_idx))
+            .map(|message| message.content.trim().to_owned())
+            .unwrap_or_default();
 
         if let Some(line_idx) = self.stream_line_index {
             if partial.is_empty() {
@@ -1759,7 +1760,6 @@ impl AuvroApp {
         self.is_loading = false;
         self.provider_response_rx = None;
         self.pending_response = None;
-        self.streaming_buffer.clear();
         self.streamed_chars = 0;
         self.stream_conversation_id = None;
         self.stream_line_index = None;
@@ -1797,7 +1797,6 @@ impl AuvroApp {
                         self.provider_response_rx = None;
                         self.stream_cancellation_token = None;
                         self.pending_response = None;
-                        self.streaming_buffer.clear();
                         self.streamed_chars = 0;
                         self.stream_conversation_id = None;
                         self.stream_line_index = None;
@@ -1813,7 +1812,6 @@ impl AuvroApp {
                         self.provider_response_rx = None;
                         self.stream_cancellation_token = None;
                         self.pending_response = None;
-                        self.streaming_buffer.clear();
                         self.streamed_chars = 0;
                         self.stream_conversation_id = None;
                         self.stream_line_index = None;
@@ -1841,11 +1839,9 @@ impl AuvroApp {
             .take(3)
             .collect();
         self.streamed_chars = (self.streamed_chars + next_chunk.chars().count()).min(chars_len);
-        self.streaming_buffer.push_str(&next_chunk);
-
         if let Some(line_idx) = self.stream_line_index {
             if let Some(message) = self.messages.get_mut(line_idx) {
-                message.content = self.streaming_buffer.clone();
+                message.content.push_str(&next_chunk);
             }
         }
 

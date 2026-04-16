@@ -109,7 +109,7 @@ fn render_message_row(
     let is_live_stream = !is_user
         && app.is_loading
         && app.stream_line_index == Some(message_index)
-        && !app.streaming_buffer.is_empty();
+        && !message.content.is_empty();
 
     ui.with_layout(
         if is_user {
@@ -167,8 +167,8 @@ fn render_message_row(
                             .wrap(),
                         );
                     } else if is_live_stream {
-                        let streaming_content = app
-                            .streaming_buffer
+                        let streaming_content = message
+                            .content
                             .replace('\u{202F}', " ")
                             .replace('\u{00A0}', " ");
                         CommonMarkViewer::new().show(

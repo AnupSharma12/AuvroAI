@@ -11,12 +11,12 @@ const DEFAULT_RETRY_COUNT: u32 = 3;
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
-    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String>;
+    fn generate_reply(&self, prompt: &str, conversation: &[Arc<str>]) -> Result<String, String>;
 
     fn generate_reply_cancelable(
         &self,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
         cancellation_token: &CancellationToken,
     ) -> Result<String, String> {
         let _ = cancellation_token;
@@ -28,7 +28,7 @@ pub trait Provider: Send + Sync {
         &self,
         system_prompt: &str,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
     ) -> Result<String, String>;
 }
 
@@ -77,7 +77,7 @@ impl Provider for FailoverProvider {
         "Failover (HackClub -> OpenRouter)"
     }
 
-    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+    fn generate_reply(&self, prompt: &str, conversation: &[Arc<str>]) -> Result<String, String> {
         match self.primary.generate_reply(prompt, conversation) {
             Ok(reply) => Ok(reply),
             Err(primary_err) => self
@@ -102,7 +102,7 @@ impl Provider for FailoverProvider {
     fn generate_reply_cancelable(
         &self,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
         cancellation_token: &CancellationToken,
     ) -> Result<String, String> {
         match self
@@ -135,7 +135,7 @@ impl Provider for FailoverProvider {
         &self,
         system_prompt: &str,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
     ) -> Result<String, String> {
         match self
             .primary
@@ -171,7 +171,7 @@ impl Provider for MockProvider {
         "Mock Provider"
     }
 
-    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+    fn generate_reply(&self, prompt: &str, conversation: &[Arc<str>]) -> Result<String, String> {
         let previous_messages = conversation.len();
         Ok(format!(
             "Demo response: I received '{}' with {} prior messages. This text is streamed token by token so the chat feels live.",
@@ -182,7 +182,7 @@ impl Provider for MockProvider {
     fn generate_reply_cancelable(
         &self,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
         cancellation_token: &CancellationToken,
     ) -> Result<String, String> {
         if cancellation_token.is_cancelled() {
@@ -195,7 +195,7 @@ impl Provider for MockProvider {
         &self,
         _system_prompt: &str,
         prompt: &str,
-        _conversation: &[String],
+        _conversation: &[Arc<str>],
     ) -> Result<String, String> {
         let title = prompt
             .split_whitespace()
@@ -265,7 +265,7 @@ impl Provider for HackClubProvider {
         "HackClub AI"
     }
 
-    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+    fn generate_reply(&self, prompt: &str, conversation: &[Arc<str>]) -> Result<String, String> {
         let cancellation_token = CancellationToken::new();
         self.generate_reply_cancelable(prompt, conversation, &cancellation_token)
     }
@@ -273,7 +273,7 @@ impl Provider for HackClubProvider {
     fn generate_reply_cancelable(
         &self,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
         cancellation_token: &CancellationToken,
     ) -> Result<String, String> {
         let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
@@ -295,7 +295,7 @@ impl Provider for HackClubProvider {
         &self,
         system_prompt: &str,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
     ) -> Result<String, String> {
         let messages =
             build_chat_messages(system_prompt, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
@@ -381,7 +381,7 @@ impl Provider for OpenRouterProvider {
         "OpenRouter"
     }
 
-    fn generate_reply(&self, prompt: &str, conversation: &[String]) -> Result<String, String> {
+    fn generate_reply(&self, prompt: &str, conversation: &[Arc<str>]) -> Result<String, String> {
         let cancellation_token = CancellationToken::new();
         self.generate_reply_cancelable(prompt, conversation, &cancellation_token)
     }
@@ -389,7 +389,7 @@ impl Provider for OpenRouterProvider {
     fn generate_reply_cancelable(
         &self,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
         cancellation_token: &CancellationToken,
     ) -> Result<String, String> {
         let messages = build_chat_messages(CORE_SYSTEM_PROMPT, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);
@@ -420,7 +420,7 @@ impl Provider for OpenRouterProvider {
         &self,
         system_prompt: &str,
         prompt: &str,
-        conversation: &[String],
+        conversation: &[Arc<str>],
     ) -> Result<String, String> {
         let messages =
             build_chat_messages(system_prompt, prompt, conversation, DEFAULT_CONTEXT_TOKEN_BUDGET);

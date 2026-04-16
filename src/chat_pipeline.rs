@@ -1,6 +1,8 @@
 use reqwest::blocking::{Client, Response};
 use serde::Serialize;
+use serde::Serializer;
 use std::io::{BufRead, BufReader};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -10,8 +12,17 @@ const DEFAULT_BACKOFF_BASE_MS: u64 = 250;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiMessage {
-    pub role: String,
-    pub content: String,
+    #[serde(serialize_with = "serialize_arc_str")]
+    pub role: Arc<str>,
+    #[serde(serialize_with = "serialize_arc_str")]
+    pub content: Arc<str>,
+}
+
+fn serialize_arc_str<S>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value.as_ref())
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +48,7 @@ struct ChatRequest<'a> {
 pub fn build_chat_messages(
     system_prompt: &str,
     prompt: &str,
-    conversation: &[String],
+    conversation: &[Arc<str>],
     max_context_tokens: usize,
 ) -> Vec<ApiMessage> {
     let mut history = Vec::new();
@@ -45,15 +56,15 @@ pub fn build_chat_messages(
     for line in conversation {
         if let Some(content) = line.strip_prefix("You:") {
             history.push(ApiMessage {
-                role: "user".to_owned(),
-                content: content.trim().to_owned(),
+                role: Arc::from("user"),
+                content: Arc::from(content.trim()),
             });
         } else if let Some(content) = line.strip_prefix("Auvro:") {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 history.push(ApiMessage {
-                    role: "assistant".to_owned(),
-                    content: trimmed.to_owned(),
+                    role: Arc::from("assistant"),
+                    content: Arc::from(trimmed),
                 });
             }
         }
@@ -79,13 +90,13 @@ pub fn build_chat_messages(
 
     let mut messages = Vec::with_capacity(selected_history.len() + 2);
     messages.push(ApiMessage {
-        role: "system".to_owned(),
-        content: system_prompt.to_owned(),
+        role: Arc::from("system"),
+        content: Arc::from(system_prompt),
     });
     messages.extend(selected_history);
     messages.push(ApiMessage {
-        role: "user".to_owned(),
-        content: prompt.to_owned(),
+        role: Arc::from("user"),
+        content: Arc::from(prompt),
     });
     messages
 }
@@ -99,13 +110,13 @@ pub fn send_streaming_chat_completion(
     let prompt = messages
         .iter()
         .rev()
-        .find(|message| message.role == "user")
-        .map(|message| message.content.as_str())
+        .find(|message| message.role.as_ref() == "user")
+        .map(|message| message.content.as_ref())
         .unwrap_or_default();
     let system_prompt = messages
         .iter()
-        .find(|message| message.role == "system")
-        .map(|message| message.content.as_str())
+        .find(|message| message.role.as_ref() == "system")
+        .map(|message| message.content.as_ref())
         .unwrap_or_default();
     let cache_key = crate::cache::response_cache::make_cache_key(prompt, &options.model, system_prompt);
 
@@ -211,8 +222,7 @@ fn read_streaming_response(
         }
 
         let line = std::str::from_utf8(&buffer)
-            .map_err(|err| format!("Stream read failed: {err}"))?
-            .to_owned();
+            .map_err(|err| format!("Stream read failed: {err}"))?;
 
         if line.trim() == "data: [DONE]" {
             break;
