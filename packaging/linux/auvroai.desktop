@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AuvroAI
+Comment=Desktop AI chat client built with Rust and egui
+Exec=auvroai
+Icon=auvroai
+Terminal=false
+Categories=Utility;Network;
+Keywords=AI;Chat;
+StartupNotify=true
