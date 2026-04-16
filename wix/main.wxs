@@ -124,7 +124,48 @@
                     </Directory>
                 </Directory>
             </Directory>
+                <Directory Id='ProgramMenuFolder'>
+                  <Directory Id='ApplicationProgramsFolder' Name='AuvroAI'/>
+                </Directory>
+                <Directory Id='DesktopFolder'/>
         </Directory>
+
+              <DirectoryRef Id='ApplicationProgramsFolder'>
+                <Component Id='StartMenuShortcut' Guid='*'>
+                  <Shortcut
+                    Id='StartMenuShortcut'
+                    Name='AuvroAI'
+                    Description='Launch AuvroAI'
+                    Target='[Bin]AuvroAI.exe'
+                    WorkingDirectory='Bin'/>
+                  <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
+                  <RegistryValue
+                    Root='HKCU'
+                    Key='Software\AuvroAI'
+                    Name='StartMenuShortcut'
+                    Type='integer'
+                    Value='1'
+                    KeyPath='yes'/>
+                </Component>
+              </DirectoryRef>
+
+              <DirectoryRef Id='DesktopFolder'>
+                <Component Id='DesktopShortcut' Guid='*'>
+                  <Shortcut
+                    Id='DesktopShortcut'
+                    Name='AuvroAI'
+                    Description='Launch AuvroAI'
+                    Target='[Bin]AuvroAI.exe'
+                    WorkingDirectory='Bin'/>
+                  <RegistryValue
+                    Root='HKCU'
+                    Key='Software\AuvroAI'
+                    Name='DesktopShortcut'
+                    Type='integer'
+                    Value='1'
+                    KeyPath='yes'/>
+                </Component>
+              </DirectoryRef>
 
         <Feature
             Id='Binaries'
@@ -142,6 +183,8 @@
             <ComponentRef Id='License'/>
             
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+            <ComponentRef Id='DesktopShortcut'/>
 
             <Feature
                 Id='Environment'
