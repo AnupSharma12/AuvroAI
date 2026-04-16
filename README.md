@@ -65,7 +65,7 @@ This repository includes native installer packaging for each platform:
 	- `cargo wix --release --nocapture`
 - Linux:
 	- `cargo install cargo-deb --locked`
-	- `cargo deb --release`
+	- `cargo deb`
 - macOS:
 	- `cargo install cargo-bundle --locked`
 	- `brew install create-dmg`
