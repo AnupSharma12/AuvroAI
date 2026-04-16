@@ -23,9 +23,6 @@ jobs:
       - name: Install WiX Toolset
         run: winget install --id WiXToolset.WiXToolset -e --accept-package-agreements --accept-source-agreements --force
 
-      - name: Initialize WiX template
-        run: cargo wix init
-
       - name: Build MSI
         run: cargo wix -b "C:\\Program Files (x86)\\WiX Toolset v3.14\\bin" --nocapture
 
@@ -92,7 +89,7 @@ jobs:
             --hide-extension "AuvroAI.app" \
             --app-drop-link 600 185 \
             "dist/AuvroAI.dmg" \
-            "target/release/bundle/osx/"
+            "target/release/bundle/osx/AuvroAI.app"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
