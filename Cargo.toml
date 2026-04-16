@@ -24,3 +24,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
 rfd = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "vulkan"] }
+
+[target.'cfg(not(windows))'.dependencies]
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan", "gles"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
