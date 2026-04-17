@@ -14,6 +14,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Create .env from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          AUVRO_API_KEY: ${{ secrets.AUVRO_API_KEY }}
+          AUVRO_ENDPOINT: ${{ secrets.AUVRO_ENDPOINT }}
+          AUVRO_MODEL: ${{ secrets.AUVRO_MODEL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        shell: pwsh
+        run: |
+          $required = @(
+            "SUPABASE_URL",
+            "SUPABASE_PUBLISHABLE_KEY",
+            "AUVRO_API_KEY",
+            "AUVRO_ENDPOINT",
+            "AUVRO_MODEL",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_BASE_URL",
+            "OPENROUTER_MODEL"
+          )
+
+          foreach ($k in $required) {
+            $v = (Get-Item "env:$k").Value
+            if ([string]::IsNullOrWhiteSpace($v)) {
+              throw "Missing GitHub secret: $k"
+            }
+          }
+
+          @"
+SUPABASE_URL=$env:SUPABASE_URL
+SUPABASE_PUBLISHABLE_KEY=$env:SUPABASE_PUBLISHABLE_KEY
+AUVRO_API_KEY=$env:AUVRO_API_KEY
+AUVRO_ENDPOINT=$env:AUVRO_ENDPOINT
+AUVRO_MODEL=$env:AUVRO_MODEL
+OPENROUTER_API_KEY=$env:OPENROUTER_API_KEY
+OPENROUTER_BASE_URL=$env:OPENROUTER_BASE_URL
+OPENROUTER_MODEL=$env:OPENROUTER_MODEL
+"@ | Set-Content -Path .env
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -38,6 +79,47 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create .env from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          AUVRO_API_KEY: ${{ secrets.AUVRO_API_KEY }}
+          AUVRO_ENDPOINT: ${{ secrets.AUVRO_ENDPOINT }}
+          AUVRO_MODEL: ${{ secrets.AUVRO_MODEL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        run: |
+          required=(
+            SUPABASE_URL
+            SUPABASE_PUBLISHABLE_KEY
+            AUVRO_API_KEY
+            AUVRO_ENDPOINT
+            AUVRO_MODEL
+            OPENROUTER_API_KEY
+            OPENROUTER_BASE_URL
+            OPENROUTER_MODEL
+          )
+
+          for key in "${required[@]}"; do
+            value="${!key}"
+            if [ -z "${value}" ]; then
+              echo "Missing GitHub secret: ${key}" >&2
+              exit 1
+            fi
+          done
+
+          cat > .env <<EOF
+SUPABASE_URL=${SUPABASE_URL}
+SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
+AUVRO_API_KEY=${AUVRO_API_KEY}
+AUVRO_ENDPOINT=${AUVRO_ENDPOINT}
+AUVRO_MODEL=${AUVRO_MODEL}
+OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL}
+OPENROUTER_MODEL=${OPENROUTER_MODEL}
+EOF
 
       - name: Install build dependencies
         run: |
@@ -65,6 +147,47 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create .env from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          AUVRO_API_KEY: ${{ secrets.AUVRO_API_KEY }}
+          AUVRO_ENDPOINT: ${{ secrets.AUVRO_ENDPOINT }}
+          AUVRO_MODEL: ${{ secrets.AUVRO_MODEL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        run: |
+          required=(
+            SUPABASE_URL
+            SUPABASE_PUBLISHABLE_KEY
+            AUVRO_API_KEY
+            AUVRO_ENDPOINT
+            AUVRO_MODEL
+            OPENROUTER_API_KEY
+            OPENROUTER_BASE_URL
+            OPENROUTER_MODEL
+          )
+
+          for key in "${required[@]}"; do
+            value="${!key}"
+            if [ -z "${value}" ]; then
+              echo "Missing GitHub secret: ${key}" >&2
+              exit 1
+            fi
+          done
+
+          cat > .env <<EOF
+SUPABASE_URL=${SUPABASE_URL}
+SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
+AUVRO_API_KEY=${AUVRO_API_KEY}
+AUVRO_ENDPOINT=${AUVRO_ENDPOINT}
+AUVRO_MODEL=${AUVRO_MODEL}
+OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL}
+OPENROUTER_MODEL=${OPENROUTER_MODEL}
+EOF
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
