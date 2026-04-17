@@ -59,13 +59,6 @@ fn supabase_rest_base() -> String {
     crate::env::supabase_rest_url()
 }
 
-fn supabase_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|err| format!("Failed to build Supabase HTTP client: {err}"))
-}
-
 fn auth_request(
     builder: reqwest::blocking::RequestBuilder,
     token: &str,
@@ -76,8 +69,7 @@ fn auth_request(
         .header("Content-Type", "application/json")
 }
 
-pub fn list_conversations(token: &str) -> Result<Vec<Conversation>, String> {
-    let client = supabase_client()?;
+pub fn list_conversations(client: &Client, token: &str) -> Result<Vec<Conversation>, String> {
     let endpoint = format!(
         "{}/conversations?select=*&order=updated_at.desc",
         supabase_rest_base()
@@ -98,8 +90,7 @@ pub fn list_conversations(token: &str) -> Result<Vec<Conversation>, String> {
         .map_err(|err| format!("Failed to parse conversations: {err}"))
 }
 
-pub fn create_conversation(token: &str, title: &str, user_id: &str) -> Result<Conversation, String> {
-    let client = supabase_client()?;
+pub fn create_conversation(client: &Client, token: &str, title: &str, user_id: &str) -> Result<Conversation, String> {
     let endpoint = format!("{}/conversations", supabase_rest_base());
 
     let response = auth_request(client.post(endpoint), token)
@@ -126,8 +117,7 @@ pub fn create_conversation(token: &str, title: &str, user_id: &str) -> Result<Co
         .ok_or_else(|| "Supabase did not return the created conversation.".to_owned())
 }
 
-pub fn rename_conversation(token: &str, id: Uuid, title: &str) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn rename_conversation(client: &Client, token: &str, id: Uuid, title: &str) -> Result<(), String> {
     let endpoint = format!("{}/conversations?id=eq.{}", supabase_rest_base(), id);
 
     let response = auth_request(client.patch(endpoint), token)
@@ -147,8 +137,7 @@ pub fn rename_conversation(token: &str, id: Uuid, title: &str) -> Result<(), Str
     Ok(())
 }
 
-pub fn delete_conversation(token: &str, id: Uuid) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn delete_conversation(client: &Client, token: &str, id: Uuid) -> Result<(), String> {
     let endpoint = format!("{}/conversations?id=eq.{}", supabase_rest_base(), id);
 
     let response = auth_request(client.delete(endpoint), token)
@@ -164,10 +153,9 @@ pub fn delete_conversation(token: &str, id: Uuid) -> Result<(), String> {
     Ok(())
 }
 
-pub fn list_messages(token: &str, conversation_id: Uuid) -> Result<Vec<Message>, String> {
-    let client = supabase_client()?;
+pub fn list_messages(client: &Client, token: &str, conversation_id: Uuid) -> Result<Vec<Message>, String> {
     let endpoint = format!(
-        "{}/messages?conversation_id=eq.{}&order=created_at.asc&select=*",
+        "{}/messages?conversation_id=eq.{}&order=created_at.desc&limit=50&select=*",
         supabase_rest_base(),
         conversation_id
     );
@@ -182,18 +170,21 @@ pub fn list_messages(token: &str, conversation_id: Uuid) -> Result<Vec<Message>,
         return Err(format!("Could not list messages ({status}): {body}"));
     }
 
-    response
+    let mut messages = response
         .json::<Vec<Message>>()
-        .map_err(|err| format!("Failed to parse messages: {err}"))
+        .map_err(|err| format!("Failed to parse messages: {err}"))?;
+
+    messages.reverse();
+    Ok(messages)
 }
 
 pub fn append_message(
+    client: &Client,
     token: &str,
     conversation_id: Uuid,
     role: &str,
     content: &str,
 ) -> Result<Message, String> {
-    let client = supabase_client()?;
     let endpoint = format!("{}/messages", supabase_rest_base());
 
     let response = auth_request(client.post(endpoint), token)
@@ -221,8 +212,7 @@ pub fn append_message(
         .ok_or_else(|| "Supabase did not return the appended message.".to_owned())
 }
 
-pub fn bump_conversation_updated_at(token: &str, id: Uuid) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn bump_conversation_updated_at(client: &Client, token: &str, id: Uuid) -> Result<(), String> {
     let endpoint = format!("{}/conversations?id=eq.{}", supabase_rest_base(), id);
 
     let response = auth_request(client.patch(endpoint), token)

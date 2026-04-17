@@ -1,6 +1,5 @@
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde_json::Value;
-use std::time::Duration;
 
 const TITLE_PROMPT: &str = "Generate a short 4-6 word title for this conversation based on the first message. Reply with only the title, no punctuation, no quotes, no explanation.";
 const MAX_TITLE_CHARS: usize = 60;
@@ -58,6 +57,39 @@ fn extract_completion_text(body: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+async fn send_with_retry(
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+    max_retries: u32,
+) -> Result<reqwest::Response, String> {
+    let mut attempts: u32 = 0;
+
+    loop {
+        match build_request().send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) if resp.status().as_u16() == 429 => {
+                if attempts >= max_retries {
+                    return Err("Rate limited".to_owned());
+                }
+                let wait = 2u64.pow(attempts) * 1000;
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                attempts += 1;
+            }
+            Ok(resp) => {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            Err(err) if attempts < max_retries => {
+                let wait = 2u64.pow(attempts) * 500;
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                attempts += 1;
+                let _ = err;
+            }
+            Err(err) => {
+                return Err(format!("Network error: {err}"));
+            }
+        }
+    }
+}
+
 pub fn extract_sse_delta_content(line: &str) -> Result<Option<String>, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with(':') {
@@ -86,7 +118,7 @@ pub fn extract_sse_delta_content(line: &str) -> Result<Option<String>, String> {
         .map(str::to_owned))
 }
 
-pub fn generate_title(first_user_message: &str) -> Result<String, String> {
+pub fn generate_title(client: &Client, first_user_message: &str) -> Result<String, String> {
     let api_key = crate::env::AUVRO_API_KEY.trim();
     let model = crate::env::AUVRO_MODEL.trim();
     let endpoint = crate::env::AUVRO_ENDPOINT.trim();
@@ -95,32 +127,44 @@ pub fn generate_title(first_user_message: &str) -> Result<String, String> {
         return Err("AUVRO endpoint/model/api key is not configured.".to_owned());
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
+    let client = client.clone();
+
+    let endpoint = chat_endpoint();
+    let api_key = api_key.to_owned();
+    let model = model.to_owned();
+    let user_prompt = first_user_message.to_owned();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
-        .map_err(|err| format!("Failed to build title client: {err}"))?;
+        .map_err(|err| format!("Failed to initialize retry runtime: {err}"))?;
 
-    let response = client
-        .post(chat_endpoint())
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [
-                { "role": "system", "content": TITLE_PROMPT },
-                { "role": "user", "content": first_user_message }
-            ],
-            "stream": false,
-            "temperature": 0.2
-        }))
-        .send()
-        .map_err(|err| format!("Title request failed: {err}"))?;
+    let text = runtime.block_on(async {
+        let response = send_with_retry(
+            || {
+                client
+                    .post(&endpoint)
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .header("Content-Type", "application/json")
+                    .json(&serde_json::json!({
+                        "model": model,
+                        "messages": [
+                            { "role": "system", "content": TITLE_PROMPT },
+                            { "role": "user", "content": user_prompt }
+                        ],
+                        "stream": false,
+                        "temperature": 0.2
+                    }))
+            },
+            3,
+        )
+        .await?;
 
-    let status = response.status();
-    let text = response.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("Title request failed ({status}): {text}"));
-    }
+        response
+            .text()
+            .await
+            .map_err(|err| format!("Failed reading title response body: {err}"))
+    })?;
 
     let body: Value = serde_json::from_str(&text)
         .map_err(|err| format!("Failed to parse title response: {err}"))?;

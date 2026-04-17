@@ -76,13 +76,6 @@ impl Profile {
     }
 }
 
-fn supabase_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|err| format!("Failed to build Supabase profile client: {err}"))
-}
-
 fn auth_request(
     builder: reqwest::blocking::RequestBuilder,
     token: &str,
@@ -105,8 +98,7 @@ fn map_profile_error(status: reqwest::StatusCode, body: String, action: &str) ->
     format!("Could not {action} ({status}): {body}")
 }
 
-pub fn get_profile(token: &str, user_id: Uuid) -> Result<Profile, String> {
-    let client = supabase_client()?;
+pub fn get_profile(client: &Client, token: &str, user_id: Uuid) -> Result<Profile, String> {
     let endpoint = format!(
         "{}/profiles?id=eq.{}&select=*",
         crate::env::supabase_rest_url(),
@@ -131,8 +123,7 @@ pub fn get_profile(token: &str, user_id: Uuid) -> Result<Profile, String> {
 }
 
 #[allow(dead_code)]
-pub fn upsert_profile(token: &str, profile: &Profile) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn upsert_profile(client: &Client, token: &str, profile: &Profile) -> Result<(), String> {
     let endpoint = format!("{}/profiles", crate::env::supabase_rest_url());
 
     let response = auth_request(client.post(endpoint), token)
@@ -156,8 +147,7 @@ pub fn upsert_profile(token: &str, profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_display_name(token: &str, user_id: Uuid, display_name: &str) -> Result<Profile, String> {
-    let client = supabase_client()?;
+pub fn update_display_name(client: &Client, token: &str, user_id: Uuid, display_name: &str) -> Result<Profile, String> {
     let endpoint = format!(
         "{}/profiles?id=eq.{}",
         crate::env::supabase_rest_url(),
@@ -189,8 +179,7 @@ pub fn update_display_name(token: &str, user_id: Uuid, display_name: &str) -> Re
     })
 }
 
-pub fn update_avatar_url(token: &str, user_id: Uuid, avatar_url: &str) -> Result<Profile, String> {
-    let client = supabase_client()?;
+pub fn update_avatar_url(client: &Client, token: &str, user_id: Uuid, avatar_url: &str) -> Result<Profile, String> {
     let endpoint = format!(
         "{}/profiles?id=eq.{}",
         crate::env::supabase_rest_url(),
@@ -222,8 +211,7 @@ pub fn update_avatar_url(token: &str, user_id: Uuid, avatar_url: &str) -> Result
     })
 }
 
-pub fn update_theme(token: &str, user_id: Uuid, theme: &str) -> Result<Profile, String> {
-    let client = supabase_client()?;
+pub fn update_theme(client: &Client, token: &str, user_id: Uuid, theme: &str) -> Result<Profile, String> {
     let endpoint = format!(
         "{}/profiles?id=eq.{}",
         crate::env::supabase_rest_url(),
@@ -255,8 +243,7 @@ pub fn update_theme(token: &str, user_id: Uuid, theme: &str) -> Result<Profile, 
     })
 }
 
-pub fn update_email(token: &str, new_email: &str) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn update_email(client: &Client, token: &str, new_email: &str) -> Result<(), String> {
     let endpoint = format!("{}/user", crate::env::supabase_auth_url());
 
     let response = auth_request(client.put(endpoint), token)
@@ -273,8 +260,7 @@ pub fn update_email(token: &str, new_email: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_password(token: &str, new_password: &str) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn update_password(client: &Client, token: &str, new_password: &str) -> Result<(), String> {
     let endpoint = format!("{}/user", crate::env::supabase_auth_url());
 
     let response = auth_request(client.put(endpoint), token)
@@ -292,12 +278,12 @@ pub fn update_password(token: &str, new_password: &str) -> Result<(), String> {
 }
 
 pub fn upload_avatar(
+    client: &Client,
     token: &str,
     user_id: Uuid,
     image_bytes: Vec<u8>,
     mime: &str,
 ) -> Result<String, String> {
-    let client = supabase_client()?;
     let base = crate::env::supabase_url();
     let upload_endpoint = format!(
         "{}/storage/v1/object/avatars/{}/avatar.jpg",
@@ -326,8 +312,7 @@ pub fn upload_avatar(
     ))
 }
 
-pub fn download_avatar(url: &str) -> Result<Vec<u8>, String> {
-    let client = supabase_client()?;
+pub fn download_avatar(client: &Client, url: &str) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .send()
@@ -345,8 +330,7 @@ pub fn download_avatar(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("Failed to read avatar bytes: {err}"))
 }
 
-pub fn delete_account(token: &str) -> Result<(), String> {
-    let client = supabase_client()?;
+pub fn delete_account(client: &Client, token: &str) -> Result<(), String> {
     let endpoint = format!("{}/user", crate::env::supabase_auth_url());
 
     let response = client

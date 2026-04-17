@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AuvroAI
+GenericName=AI Chat Assistant
+Comment=Your AI Chat Assistant powered by AuvroAI
+Exec=auvro_ai
+Icon=auvroai
+Terminal=false
+StartupNotify=true
+Categories=Network;Chat;Utility;

@@ -23,12 +23,15 @@ fn app_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
 		return texture;
 	}
 
-	let image = image::load_from_memory(include_bytes!("../../assets/icons/Auvro.png"))
-		.expect("Failed to decode Auvro.png")
-		.to_rgba8();
-	let size = [image.width() as usize, image.height() as usize];
-	let pixels = image.into_raw();
-	let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+	let color_image = match image::load_from_memory(include_bytes!("../../assets/icons/Auvro.png")) {
+		Ok(image) => {
+			let image = image.to_rgba8();
+			let size = [image.width() as usize, image.height() as usize];
+			let pixels = image.into_raw();
+			egui::ColorImage::from_rgba_unmultiplied(size, &pixels)
+		}
+		Err(_) => egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]),
+	};
 	let texture = ctx.load_texture("auvro_app_logo", color_image, egui::TextureOptions::LINEAR);
 
 	ctx.data_mut(|data| data.insert_temp(texture_id, texture.clone()));

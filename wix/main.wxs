@@ -116,9 +116,9 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='AuvroAI.exe'
+                            Name='auvro_ai.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\AuvroAI.exe'
+                            Source='$(var.CargoTargetBinDir)\auvro_ai.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -136,7 +136,9 @@
                     Id='StartMenuShortcut'
                     Name='AuvroAI'
                     Description='Launch AuvroAI'
-                    Target='[Bin]AuvroAI.exe'
+                    Icon='ProductICO'
+                    IconIndex='0'
+                    Target='[Bin]auvro_ai.exe'
                     WorkingDirectory='Bin'/>
                   <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
                   <RegistryValue
@@ -155,7 +157,9 @@
                     Id='DesktopShortcut'
                     Name='AuvroAI'
                     Description='Launch AuvroAI'
-                    Target='[Bin]AuvroAI.exe'
+                    Icon='ProductICO'
+                    IconIndex='0'
+                    Target='[Bin]auvro_ai.exe'
                     WorkingDirectory='Bin'/>
                   <RegistryValue
                     Root='HKCU'
@@ -203,7 +207,7 @@
           Add/Remove Programs control panel requires commenting out or
           removing the following `Icon` and `Property` tags.
         -->
-        <Icon Id='ProductICO' SourceFile='assets/icons/Auvro.ico'/>
+        <Icon Id='ProductICO' SourceFile='assets/icon.ico'/>
         <Property Id='ARPPRODUCTICON' Value='ProductICO' />
         
         

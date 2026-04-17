@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod api;
 mod chat_pipeline;
 mod cache;
@@ -48,6 +50,7 @@ enum SupabaseEvent {
     AvatarUrlUpdated(Result<Profile, String>),
     AvatarDownloaded(Result<(String, Vec<u8>), String>),
     AccountDeleted(Result<(), String>),
+    SessionRefreshed(Result<serde_json::Value, String>),
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +118,8 @@ struct PendingTitleGeneration {
 }
 
 pub(crate) struct AuvroApp {
+    pub(crate) http_client: reqwest::blocking::Client,
+    pub(crate) async_http_client: reqwest::Client,
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) draft_message: String,
     pub(crate) conversations: Vec<Conversation>,
@@ -135,6 +140,9 @@ pub(crate) struct AuvroApp {
     pub(crate) user_email: Option<String>,
     pub(crate) user_full_name: Option<String>,
     pub(crate) auth_error: Option<String>,
+    pub(crate) token_refreshing: bool,
+    pub(crate) session_expires_at: Option<i64>,
+    pub(crate) session_refresh_token: Option<String>,
     pub(crate) profile_menu_open: bool,
     pub(crate) show_settings: bool,
     pub(crate) show_sidebar: bool,
@@ -183,6 +191,20 @@ pub(crate) enum AuthMode {
 
 impl Default for AuvroApp {
     fn default() -> Self {
+        let http_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Failed to build blocking HTTP client");
+
+        let async_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Failed to build async HTTP client");
+
         let supabase_runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -231,6 +253,8 @@ impl Default for AuvroApp {
         let settings_email_draft = user_email.clone().unwrap_or_default();
 
         let mut app = Self {
+            http_client,
+            async_http_client,
             provider: create_default_provider(),
             draft_message: String::new(),
             conversations: Vec::new(),
@@ -251,6 +275,9 @@ impl Default for AuvroApp {
             user_email,
             user_full_name,
             auth_error,
+            token_refreshing: false,
+            session_expires_at: None,
+            session_refresh_token: None,
             profile_menu_open: false,
             show_settings: false,
             show_sidebar: true,
@@ -335,10 +362,12 @@ impl AuvroApp {
     ) -> Result<(String, String, Option<String>), String> {
         let endpoint = format!(
             "{}/auth/v1/user",
-            crate::env::normalized_supabase_url(url)
+            url.trim_end_matches('/')
         );
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(10)
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -389,6 +418,49 @@ impl AuvroApp {
             .map_err(|_| "Missing auth session token. Please log in again.".to_owned())
     }
 
+    fn maybe_refresh_session_token(&mut self) {
+        if self.token_refreshing || !self.is_authenticated {
+            return;
+        }
+
+        let Some(expires_at) = self.session_expires_at else {
+            return;
+        };
+
+        if expires_at - chrono::Utc::now().timestamp() >= 120 {
+            return;
+        }
+
+        let Some(refresh_token) = self.session_refresh_token.clone() else {
+            return;
+        };
+
+        self.token_refreshing = true;
+        let client = self.http_client.clone();
+        let runtime = Arc::clone(&self.supabase_runtime);
+        let tx = self.supabase_events_tx.clone();
+
+        runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let response = crate::api::supabase::refresh_session_with_client(&client, &refresh_token)?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().unwrap_or_default();
+                    return Err(format!("Session refresh failed ({status}): {body}"));
+                }
+
+                response
+                    .json::<serde_json::Value>()
+                    .map_err(|err| format!("Failed to parse refresh response: {err}"))
+            })
+            .await
+            .map_err(|err| format!("Failed to run refresh-session task: {err}"))
+            .and_then(|result| result);
+
+            let _ = tx.send(SupabaseEvent::SessionRefreshed(result));
+        });
+    }
+
     fn current_user_uuid(&self) -> Result<Uuid, String> {
         let user_id = self
             .user_id
@@ -417,6 +489,26 @@ impl AuvroApp {
         }
     }
 
+    fn session_expires_at_from_payload(payload: &serde_json::Value) -> Option<i64> {
+        if let Some(expires_at) = payload.get("expires_at").and_then(|v| v.as_i64()) {
+            return Some(expires_at);
+        }
+
+        payload
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .map(|expires_in| chrono::Utc::now().timestamp() + expires_in)
+    }
+
+    fn session_refresh_token_from_payload(payload: &serde_json::Value) -> Option<String> {
+        payload
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_owned())
+    }
+
     fn request_load_profile(&mut self) {
         let token = match self.access_token() {
             Ok(token) => token,
@@ -435,10 +527,11 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || profile::get_profile(&token, user_id))
+            let result = tokio::task::spawn_blocking(move || profile::get_profile(&client, &token, user_id))
                 .await
                 .map_err(|err| format!("Failed to run profile-load task: {err}"))
                 .and_then(|result| result);
@@ -464,11 +557,12 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                profile::update_display_name(&token, user_id, &display_name)
+                profile::update_display_name(&client, &token, user_id, &display_name)
             })
             .await
             .map_err(|err| format!("Failed to run display-name update task: {err}"))
@@ -495,11 +589,12 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                profile::update_theme(&token, user_id, theme.as_str())
+                profile::update_theme(&client, &token, user_id, theme.as_str())
             })
             .await
             .map_err(|err| format!("Failed to run theme-update task: {err}"))
@@ -518,12 +613,13 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let email = new_email.clone();
             let result = tokio::task::spawn_blocking(move || {
-                profile::update_email(&token, &new_email)?;
+                profile::update_email(&client, &token, &new_email)?;
                 Ok::<String, String>(email)
             })
             .await
@@ -543,10 +639,11 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || profile::update_password(&token, &new_password))
+            let result = tokio::task::spawn_blocking(move || profile::update_password(&client, &token, &new_password))
                 .await
                 .map_err(|err| format!("Failed to run password-update task: {err}"))
                 .and_then(|result| result);
@@ -572,11 +669,12 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                profile::upload_avatar(&token, user_id, image_bytes, &mime)
+                profile::upload_avatar(&client, &token, user_id, image_bytes, &mime)
             })
             .await
             .map_err(|err| format!("Failed to run avatar-upload task: {err}"))
@@ -603,11 +701,12 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                profile::update_avatar_url(&token, user_id, &avatar_url)
+                profile::update_avatar_url(&client, &token, user_id, &avatar_url)
             })
             .await
             .map_err(|err| format!("Failed to run avatar-url update task: {err}"))
@@ -617,12 +716,13 @@ impl AuvroApp {
     }
 
     fn request_download_avatar(&self, avatar_url: String) {
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let url = avatar_url.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let bytes = profile::download_avatar(&avatar_url)?;
+                let bytes = profile::download_avatar(&client, &avatar_url)?;
                 Ok::<(String, Vec<u8>), String>((url, bytes))
             })
             .await
@@ -642,10 +742,11 @@ impl AuvroApp {
         };
 
         self.profile_loading = true;
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || profile::delete_account(&token))
+            let result = tokio::task::spawn_blocking(move || profile::delete_account(&client, &token))
                 .await
                 .map_err(|err| format!("Failed to run account-delete task: {err}"))
                 .and_then(|result| result);
@@ -671,10 +772,11 @@ impl AuvroApp {
             }
         };
 
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || conversations::list_conversations(&token))
+            let result = tokio::task::spawn_blocking(move || conversations::list_conversations(&client, &token))
                 .await
                 .map_err(|err| format!("Failed to run conversation-list task: {err}"))
                 .and_then(|result| result);
@@ -704,11 +806,12 @@ impl AuvroApp {
         };
 
         let title = title.to_owned();
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                conversations::create_conversation(&token, &title, &user_id)
+                conversations::create_conversation(&client, &token, &title, &user_id)
             })
                 .await
                 .map_err(|err| format!("Failed to run conversation-create task: {err}"))
@@ -727,10 +830,11 @@ impl AuvroApp {
             }
         };
 
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || conversations::list_messages(&token, conversation_id))
+            let result = tokio::task::spawn_blocking(move || conversations::list_messages(&client, &token, conversation_id))
                 .await
                 .map_err(|err| format!("Failed to run messages-list task: {err}"))
                 .and_then(|result| result);
@@ -750,10 +854,11 @@ impl AuvroApp {
             }
         };
 
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || conversations::delete_conversation(&token, conversation_id))
+            let result = tokio::task::spawn_blocking(move || conversations::delete_conversation(&client, &token, conversation_id))
                 .await
                 .map_err(|err| format!("Failed to run conversation-delete task: {err}"))
                 .and_then(|result| result);
@@ -771,11 +876,12 @@ impl AuvroApp {
         };
 
         let role = role.to_owned();
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                conversations::append_message(&token, conversation_id, &role, &content)
+                conversations::append_message(&client, &token, conversation_id, &role, &content)
             })
             .await
             .map_err(|err| format!("Failed to run append-message task: {err}"))
@@ -790,11 +896,12 @@ impl AuvroApp {
             Err(_) => return,
         };
 
+        let client = self.http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                conversations::bump_conversation_updated_at(&token, conversation_id)
+                conversations::bump_conversation_updated_at(&client, &token, conversation_id)
             })
             .await
             .map_err(|err| format!("Failed to run bump-conversation task: {err}"))
@@ -812,12 +919,14 @@ impl AuvroApp {
             Err(_) => return,
         };
 
+        let client = self.http_client.clone();
+        let async_client = self.async_http_client.clone();
         let runtime = Arc::clone(&self.supabase_runtime);
         let tx = self.supabase_events_tx.clone();
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let title = crate::api::ai::generate_title(&first_user_message)?;
-                conversations::rename_conversation(&token, conversation_id, &title)?;
+                let title = crate::api::ai::generate_title(&async_client, &first_user_message)?;
+                conversations::rename_conversation(&client, &token, conversation_id, &title)?;
                 Ok::<(Uuid, String), String>((conversation_id, title))
             })
             .await
@@ -1078,6 +1187,28 @@ impl AuvroApp {
                         Err(err) => self.settings_account_status = Some(SettingsStatus::error(err)),
                     }
                 }
+                SupabaseEvent::SessionRefreshed(result) => {
+                    self.token_refreshing = false;
+                    match result {
+                        Ok(payload) => {
+                            if let Some(token) = payload
+                                .get("access_token")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                            {
+                                self.session_access_token = Some(token.to_owned());
+                                let _ = SecretStore::new("AuvroAI").set("SUPABASE_ACCESS_TOKEN", token);
+                            }
+
+                            self.session_expires_at = Self::session_expires_at_from_payload(&payload);
+                            self.session_refresh_token = Self::session_refresh_token_from_payload(&payload);
+                        }
+                        Err(err) => {
+                            self.error_message = Some(err);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1240,7 +1371,11 @@ impl AuvroApp {
             return;
         }
 
-        let response = match crate::api::supabase::signin_with_password(&email, &password) {
+        let response = match crate::api::supabase::signin_with_password_with_client(
+            &self.http_client,
+            &email,
+            &password,
+        ) {
             Ok(resp) => resp,
             Err(err) => {
                 self.auth_notice = Some(err);
@@ -1302,6 +1437,8 @@ impl AuvroApp {
 
         self.is_authenticated = true;
         self.session_access_token = Some(access_token.clone());
+        self.session_expires_at = Self::session_expires_at_from_payload(&payload);
+        self.session_refresh_token = Self::session_refresh_token_from_payload(&payload);
         self.user_id = user_id.clone();
         self.user_email = Some(user_email.clone());
         self.user_full_name = user_full_name;
@@ -1351,18 +1488,9 @@ impl AuvroApp {
         }
 
         let endpoint = format!("{}/signup", crate::env::supabase_auth_url());
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .build()
-        {
-            Ok(client) => client,
-            Err(err) => {
-                self.auth_notice = Some(format!("Signup setup failed: {err}"));
-                return;
-            }
-        };
 
-        let response = client
+        let response = self
+            .http_client
             .post(endpoint)
             .header("apikey", crate::env::SUPABASE_PUBLISHABLE_KEY)
             .header("Content-Type", "application/json")
@@ -1423,6 +1551,8 @@ impl AuvroApp {
 
             self.is_authenticated = true;
             self.session_access_token = Some(access_token.clone());
+            self.session_expires_at = Self::session_expires_at_from_payload(&payload);
+            self.session_refresh_token = Self::session_refresh_token_from_payload(&payload);
             self.user_id = user_id;
             self.user_email = Some(user_email.clone());
             self.user_full_name = user_full_name;
@@ -1464,7 +1594,10 @@ impl AuvroApp {
         let secret_store = SecretStore::new("AuvroAI");
         let _ = secret_store.delete("SUPABASE_ACCESS_TOKEN");
         self.is_authenticated = false;
+        self.token_refreshing = false;
         self.session_access_token = None;
+        self.session_expires_at = None;
+        self.session_refresh_token = None;
         self.user_id = None;
         self.user_email = None;
         self.user_full_name = None;
@@ -1871,6 +2004,7 @@ impl AuvroApp {
 impl eframe::App for AuvroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.expire_settings_statuses();
+        self.maybe_refresh_session_token();
         self.process_supabase_events(ctx);
         self.tick_streaming(ctx);
 
@@ -1949,41 +2083,27 @@ impl eframe::App for AuvroApp {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    dotenvy::dotenv().ok();
-    let _ = load_environment();
-
-    let options = eframe::NativeOptions {
+    let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 680.0])
-            .with_min_inner_size([360.0, 500.0])
-            .with_icon(load_app_icon()),
+            .with_title("AuvroAI")
+            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size([1280.0, 800.0])
+            .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
 
     eframe::run_native(
         "AuvroAI",
-        options,
+        native_options,
         Box::new(|_cc| Ok(Box::<AuvroApp>::default())),
     )
 }
 
-fn load_environment() -> bool {
-    if let Ok(executable_path) = std::env::current_exe() {
-        if let Some(executable_dir) = executable_path.parent() {
-            let executable_env = executable_dir.join(".env");
-            if executable_env.exists() && dotenvy::from_path(&executable_env).is_ok() {
-                return true;
-            }
-        }
-    }
-
-    dotenvy::dotenv().is_ok()
-}
-
-fn load_app_icon() -> egui::IconData {
-    let image = image::load_from_memory(include_bytes!("../assets/icons/Auvro.png"))
-        .expect("Failed to decode Auvro.png for app icon")
-        .to_rgba8();
+fn load_icon() -> egui::IconData {
+    let icon_bytes = include_bytes!("../assets/icon.png");
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Icon PNG is invalid")
+        .into_rgba8();
     let (width, height) = image.dimensions();
 
     egui::IconData {

@@ -66,10 +66,8 @@ fn password_field(
         }
     });
 
-    (
-        changed,
-        input_response.expect("password input response should always be present"),
-    )
+    let fallback = ui.allocate_response(egui::vec2(width, 0.0), egui::Sense::hover());
+    (changed, input_response.unwrap_or(fallback))
 }
 
 fn notice_box(ui: &mut egui::Ui, text: &str, is_error: bool, width: f32) {

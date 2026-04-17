@@ -6,25 +6,30 @@ description = "Cross-platform Rust desktop AI chat client with streaming respons
 license = "MIT"
 authors = ["Anup"]
 
+[[bin]]
+name = "auvro_ai"
+path = "src/main.rs"
+
+[package.metadata.winres]
+FileDescription = "AuvroAI"
+ProductName = "AuvroAI"
+LegalCopyright = "Copyright 2026 AuvroAI"
+
 [package.metadata.bundle]
 name = "AuvroAI"
-identifier = "com.auvro.ai"
+identifier = "com.auvroai.app"
 short_description = "Desktop AI chat client built with Rust and egui."
-category = "Productivity"
+version = "1.0.0"
+copyright = "Copyright 2024 AuvroAI"
+category = "public.app-category.productivity"
 icon = [
-	"assets/icons/Auvro-16.png",
-	"assets/icons/Auvro-24.png",
-	"assets/icons/Auvro-32.png",
-	"assets/icons/Auvro-48.png",
-	"assets/icons/Auvro-64.png",
-	"assets/icons/Auvro-128.png",
-	"assets/icons/Auvro-256.png",
+	"assets/icon.icns",
 ]
 
 [package.metadata.wix]
 manufacturer = "AuvroAI"
 license = "LICENSE"
-product-icon = "assets/icons/Auvro.ico"
+product-icon = "assets/icon.ico"
 eula = false
 
 [package.metadata.deb]
@@ -34,15 +39,14 @@ depends = "$auto"
 section = "utils"
 priority = "optional"
 assets = [
-	["target/release/AuvroAI", "usr/bin/auvroai", "755"],
-	["assets/icons/Auvro-256.png", "usr/share/icons/hicolor/256x256/apps/auvroai.png", "644"],
-	["packaging/linux/auvroai.desktop", "usr/share/applications/auvroai.desktop", "644"],
+	["target/release/auvro_ai", "usr/bin/auvro_ai", "755"],
+	["assets/icon.png", "usr/share/icons/auvroai.png", "644"],
+	["assets/auvroai.desktop", "usr/share/applications/auvroai.desktop", "644"],
 ]
 
 [dependencies]
 eframe = { version = "*", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 egui_commonmark = { version = "*", default-features = false, features = ["pulldown_cmark"] }
-dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 keyring = "3.6"
 aes-gcm = "0.10"
@@ -61,6 +65,9 @@ uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
 rfd = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
+[build-dependencies]
+winres = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "vulkan"] }
 
@@ -71,4 +78,8 @@ wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulka
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+opt-level = 3
 panic = "abort"
+
+[profile.release.build-override]
+opt-level = 3
