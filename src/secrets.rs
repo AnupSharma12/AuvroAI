@@ -85,8 +85,25 @@ impl SecretStore {
     }
 
     fn keyring_usable(service_name: &str) -> bool {
-        let entry = keyring::Entry::new(service_name, "__keyring_probe__");
-        entry.is_ok()
+        #[cfg(target_os = "linux")]
+        {
+            let has_session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty());
+            if !has_session_bus {
+                return false;
+            }
+        }
+
+        let Ok(entry) = keyring::Entry::new(service_name, "__keyring_probe__") else {
+            return false;
+        };
+
+        match entry.get_password() {
+            Ok(_) => true,
+            Err(keyring::Error::NoEntry) => true,
+            Err(_) => false,
+        }
     }
 
     fn get_from_keyring(&self, key: &str) -> Result<String, String> {
