@@ -44,16 +44,17 @@ jobs:
             }
           }
 
-          @"
-SUPABASE_URL=$env:SUPABASE_URL
-SUPABASE_PUBLISHABLE_KEY=$env:SUPABASE_PUBLISHABLE_KEY
-AUVRO_API_KEY=$env:AUVRO_API_KEY
-AUVRO_ENDPOINT=$env:AUVRO_ENDPOINT
-AUVRO_MODEL=$env:AUVRO_MODEL
-OPENROUTER_API_KEY=$env:OPENROUTER_API_KEY
-OPENROUTER_BASE_URL=$env:OPENROUTER_BASE_URL
-OPENROUTER_MODEL=$env:OPENROUTER_MODEL
-"@ | Set-Content -Path .env
+          $lines = @(
+            "SUPABASE_URL=$env:SUPABASE_URL",
+            "SUPABASE_PUBLISHABLE_KEY=$env:SUPABASE_PUBLISHABLE_KEY",
+            "AUVRO_API_KEY=$env:AUVRO_API_KEY",
+            "AUVRO_ENDPOINT=$env:AUVRO_ENDPOINT",
+            "AUVRO_MODEL=$env:AUVRO_MODEL",
+            "OPENROUTER_API_KEY=$env:OPENROUTER_API_KEY",
+            "OPENROUTER_BASE_URL=$env:OPENROUTER_BASE_URL",
+            "OPENROUTER_MODEL=$env:OPENROUTER_MODEL"
+          )
+          Set-Content -Path .env -Value $lines
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
