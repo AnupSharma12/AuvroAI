@@ -1,17 +1,17 @@
 # AuvroAI
-AuvroAI is a desktop AI chat app written in Rust with a focus on fast startup, local-first responsiveness, streaming chat, and measurable optimization work.
+AuvroAI is a desktop AI chat app written in Rust, focused on fast startup, local-first responsiveness, and streaming chat. Optimization work is tracked and benchmarked.
 
-It uses `eframe/egui` for the UI, Supabase for chat history and profile data, and a provider abstraction that can talk to HackClub AI or OpenRouter. If no remote provider is configured, the app falls back to a local mock provider for demo and development workflows.
+It uses `eframe/egui` for the UI, Supabase for chat history and profile data, and a provider abstraction that can talk to HackClub AI or OpenRouter. If no remote provider is configured, the app falls back to a local mock provider for demo and development.
 
 ## Features
 
 - Desktop chat UI with sidebar session management, a central conversation panel, and settings.
 - Streaming assistant responses with cancellation support.
-- Secure API key storage through the operating system keychain, with encrypted local fallback.
+- Secure API key storage through the OS keychain, with encrypted local fallback.
 - Session history persisted in Supabase.
-- Lazy-loaded model metadata so the settings panel does not slow down startup.
+- Lazy-loaded model metadata so the settings panel doesn't slow down startup.
 - Response caching and memory-focused streaming optimizations.
-- Cross-platform release configuration for Windows, Linux, and macOS builds.
+- Cross-platform release builds for Windows, Linux, and macOS.
 
 ## Requirements
 
@@ -25,7 +25,7 @@ It uses `eframe/egui` for the UI, Supabase for chat history and profile data, an
 
 1. Copy [.env.example](.env.example) to `.env`.
 2. Fill in the required values for Supabase and at least one provider.
-3. Run the app with `cargo run`.
+3. Run with `cargo run`.
 
 ### Environment Variables
 
@@ -45,14 +45,13 @@ It uses `eframe/egui` for the UI, Supabase for chat history and profile data, an
 ## Usage
 
 - Start a new chat from the sidebar.
-- Type a message and press Enter to send.
-- Use Ctrl+Enter for a newline in the composer.
+- Press Enter to send, Ctrl+Enter for a newline in the composer.
 - Open Settings to manage display name, email, password, theme, and model metadata.
 - Copy assistant messages with the copy button in each response bubble.
 
 ## Installer Builds
 
-This repository includes native installer packaging for each platform:
+Native installer packaging for each platform:
 
 - Windows: `.msi` via `cargo-wix`
 - Linux: `.deb` via `cargo-deb`
@@ -74,12 +73,11 @@ This repository includes native installer packaging for each platform:
 
 ### CI Build
 
-Run the GitHub Actions workflow at `.github/workflows/build-installers.yml` using `workflow_dispatch`, or push a tag like `v0.1.0`.
-The workflow uploads `windows-msi`, `linux-deb`, and `macos-dmg` artifacts.
+Run the GitHub Actions workflow at `.github/workflows/build-installers.yml` via `workflow_dispatch`, or push a tag like `v0.1.0`. The workflow uploads `windows-msi`, `linux-deb`, and `macos-dmg` artifacts.
 
 ## Implementation Notes
 
-- [src/provider.rs](src/provider.rs) defines the provider trait and failover routing between HackClub, OpenRouter, and the local mock provider.
+- [src/provider.rs](src/provider.rs) defines the provider trait and failover routing between HackClub, OpenRouter, and the local mock.
 - [src/chat_pipeline.rs](src/chat_pipeline.rs) builds the chat payload, handles streaming SSE/chunked responses, and feeds the response cache.
 - [src/main.rs](src/main.rs) owns session state, streaming orchestration, and conversation history.
 - [src/ui/chat.rs](src/ui/chat.rs) renders the message feed and live streaming state.
@@ -88,15 +86,15 @@ The workflow uploads `windows-msi`, `linux-deb`, and `macos-dmg` artifacts.
 
 ## Optimization
 
-This pass focused on reducing startup cost, cutting allocation churn in the chat pipeline, trimming the dependency graph, and shrinking the release binary without changing the app's core behavior.
+This pass focused on reducing startup cost, cutting allocation churn in the chat pipeline, trimming the dependency graph, and shrinking the release binary without changing behavior.
 
 ### What Changed
 
-- Technique 1 added an application-level response cache so repeated prompts return immediately instead of recomputing a response.
-- Technique 2 moved session history and model metadata loading behind user actions, which reduced cold-start work.
-- Technique 3 reduced allocation pressure in the streaming path by reusing buffers and switching immutable chat payload data to shared `Arc<str>` values.
-- Technique 4 removed unused dependencies and disabled unnecessary default features to simplify the build graph.
-- Technique 5 tightened the release profile with thin LTO, single codegen units, symbol stripping, and `panic = "abort"`.
+- Added an application-level response cache so repeated prompts return immediately.
+- Moved session history and model metadata loading behind user actions, cutting cold-start work.
+- Reduced allocation pressure in the streaming path by reusing buffers and switching immutable chat payload data to shared `Arc<str>` values.
+- Removed unused dependencies and disabled unnecessary default features to simplify the build graph.
+- Tightened the release profile with thin LTO, single codegen units, symbol stripping, and `panic = "abort"`.
 
 ### Implementation Notes
 
@@ -110,8 +108,8 @@ This pass focused on reducing startup cost, cutting allocation churn in the chat
 | Metric | Before | After |
 |-------|--------|-------|
 | Cold start time | 1130 ms | 0 ms |
-| Avg response latency P50 / P95 | 220 ms / 225 ms | 0 ms cached / not separately re-benchmarked |
-| Peak RSS memory | 22088.00 MB | 16304.00 MB |
+| Avg response latency P50 / P95 | 220 ms / 225 ms | 0 ms (cache hit) / not re-benchmarked |
+| Peak RSS memory | 22088 MB | 16304 MB |
 | Release binary size | 30.47 MB | 19.91 MB |
 
 ### Benchmark Setup
@@ -129,10 +127,10 @@ This pass focused on reducing startup cost, cutting allocation churn in the chat
 
 ## Troubleshooting
 
-- If the app panics with a missing `wgpu` backend, make sure you are running a build with the platform-specific backend features enabled in [Cargo.toml](Cargo.toml).
-- If sign-in or profile calls fail, verify the Supabase URL, publishable key, and database setup.
-- If the app starts in mock/demo mode, check that a provider API key and endpoint are configured.
+- If the app panics with a missing `wgpu` backend, make sure the build has the platform-specific backend features enabled in [Cargo.toml](Cargo.toml).
+- If sign-in or profile calls fail, check the Supabase URL, publishable key, and database setup.
+- If the app starts in mock/demo mode, a provider API key and endpoint are probably missing from `.env`.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
+MIT. See [LICENSE](LICENSE).
